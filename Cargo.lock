@@ -931,6 +931,7 @@ dependencies = [
  "opendal",
  "predicates",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tar",

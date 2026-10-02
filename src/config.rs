@@ -108,6 +108,31 @@ pub struct JobConfig {
     /// Run this job once at daemon start, before its first scheduled run.
     #[serde(default)]
     pub run_on_start: bool,
+
+    /// Optional defaults for `dvb restore <job>`.
+    #[serde(default)]
+    pub restore: Option<RestoreConfig>,
+}
+
+/// Optional default settings for restoring a job's backup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreConfig {
+    /// Default extraction target directory when no script is specified.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+
+    /// Optional default restore script to execute.
+    #[serde(default)]
+    pub script: Option<PathBuf>,
+
+    /// Timeout in seconds for the restore script.
+    #[serde(default = "default_script_timeout")]
+    pub script_timeout_secs: u64,
+}
+
+const fn default_script_timeout() -> u64 {
+    3600
 }
 
 /// Default grace period (in seconds) to wait for running jobs to finish on shutdown.
@@ -1041,6 +1066,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
             pre: vec![],
             post: vec![],
             run_on_start: false,
+            restore: None,
         };
         let now = Utc.with_ymd_and_hms(2024, 3, 5, 6, 7, 8).unwrap();
         assert_eq!(job.object_name(now), "pgdata-20240305T060708Z.tar.zst");
@@ -1175,5 +1201,53 @@ filename = "db-%Y%m%dT%H%M%SZ"
         // Ranges as documented by zstd (1..=19) and gzip (1..=9).
         assert!((1..=19).contains(&Compression::zstd_level()));
         assert!((1..=9).contains(&Compression::gzip_level()));
+    }
+
+    #[test]
+    fn parses_restore_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+
+  [job.restore]
+  dir = "/restore"
+  script = "/scripts/pg_restore.sh"
+  script_timeout_secs = 1800
+"#;
+        let config = parse(body, dir.path()).unwrap();
+        let restore = config.jobs[0].restore.as_ref().expect("restore configured");
+        assert_eq!(restore.dir.as_deref(), Some(Path::new("/restore")));
+        assert_eq!(
+            restore.script.as_deref(),
+            Some(Path::new("/scripts/pg_restore.sh"))
+        );
+        assert_eq!(restore.script_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn rejects_unknown_fields_in_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+
+  [job.restore]
+  dir = "/restore"
+  unknown = true
+"#;
+        let err = parse(body, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+        assert!(err.to_string().contains("`unknown`"), "{err}");
     }
 }

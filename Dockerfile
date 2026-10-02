@@ -30,7 +30,7 @@ RUN apt-get update \
     && mkdir -p /run/dvb /etc/dvb
 COPY --from=builder /app/target/release/dvb /usr/local/bin/dvb
 LABEL org.opencontainers.image.title="dvb" \
-    org.opencontainers.image.description="Docker volume backup tool: tar+compress mounted paths and stream them to object storage" \
+    org.opencontainers.image.description="Docker volume backup tool in Rust" \
     org.opencontainers.image.licenses="MIT"
 ENV TZ=UTC
 # Runs as root on purpose: it must be able to read arbitrary mounted volumes and

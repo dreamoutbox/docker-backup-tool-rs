@@ -39,6 +39,7 @@ impl JobBuilder {
                 pre: Vec::new(),
                 post: Vec::new(),
                 run_on_start: false,
+                restore: None,
             },
         }
     }

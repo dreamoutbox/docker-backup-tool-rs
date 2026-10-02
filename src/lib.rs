@@ -10,6 +10,7 @@ pub mod error;
 pub mod hooks;
 pub mod job;
 pub mod lock;
+pub mod restore;
 pub mod retention;
 pub mod scheduler;
 pub mod signal;

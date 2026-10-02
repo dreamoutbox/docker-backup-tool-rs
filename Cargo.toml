@@ -62,6 +62,9 @@ bollard = "=0.21.1"
 # bollard, listed here because we name it directly.
 futures-util = "=0.3.34"
 
+# Filesystem stats and user checks for restore
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

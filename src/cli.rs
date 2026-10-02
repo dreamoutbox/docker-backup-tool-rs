@@ -89,6 +89,64 @@ pub enum Command {
 
     /// Validate the configuration and test storage/docker connectivity.
     Check,
+
+    /// Restore a backup to a directory.
+    Restore {
+        /// Name of the job as defined in the config file.
+        job: String,
+
+        /// Exact backup object name (under the job's storage prefix).
+        #[arg(long, conflicts_with = "at")]
+        name: Option<String>,
+
+        /// Newest backup at or before this time (RFC3339 or YYYY-MM-DD).
+        #[arg(long, conflicts_with = "name")]
+        at: Option<String>,
+
+        /// Extraction target directory.
+        #[arg(long)]
+        to: Option<PathBuf>,
+
+        /// Script to execute after extraction.
+        #[arg(long)]
+        script: Option<PathBuf>,
+
+        /// Timeout in seconds for the restore script.
+        #[arg(long)]
+        script_timeout: Option<u64>,
+
+        /// Allow extracting into an existing non-empty directory.
+        #[arg(long)]
+        force: bool,
+
+        /// Delete extracted directory after the script succeeds (default: true).
+        #[arg(long, default_value = "true", num_args = 0..=1, default_missing_value = "true")]
+        cleanup: bool,
+
+        /// Stop containers while the restore script runs.
+        #[arg(long)]
+        stop_containers: bool,
+
+        /// Skip checksum verification.
+        #[arg(long)]
+        no_verify: bool,
+
+        /// Resolve the backup and print the plan without downloading.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Restore file ownership when running as root.
+        #[arg(long)]
+        preserve_owner: bool,
+
+        /// Maximum allowed extracted bytes (guard against decompression bombs).
+        #[arg(long)]
+        max_extracted_bytes: Option<u64>,
+
+        /// Extra arguments passed to the restore script.
+        #[arg(last = true)]
+        extra_args: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -108,7 +166,10 @@ mod tests {
             .get_subcommands()
             .map(clap::Command::get_name)
             .collect();
-        assert_eq!(names, ["run", "backup", "prune", "list", "check"]);
+        assert_eq!(
+            names,
+            ["run", "backup", "prune", "list", "check", "restore"]
+        );
     }
 
     #[test]

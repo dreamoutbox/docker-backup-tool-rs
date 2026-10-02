@@ -22,12 +22,19 @@ pub const EXIT_SUCCESS: u8 = 0;
 /// failed. The caller can treat the backup as valid.
 pub const EXIT_PARTIAL: u8 = 2;
 
+/// Exit code returned when restore extracted OK but the post-restore script failed.
+pub const EXIT_SCRIPT_FAILURE: u8 = 3;
+
 /// Every error this crate can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A subcommand parsed fine but is not wired up yet.
     #[error("`dvb {0}` is not implemented yet")]
     NotImplemented(&'static str),
+
+    /// A restore operation failed.
+    #[error("restore failed: {0}")]
+    Restore(String),
 
     /// The configuration could not be loaded or is invalid.
     #[error(transparent)]

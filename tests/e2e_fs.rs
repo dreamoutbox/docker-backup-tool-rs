@@ -117,6 +117,12 @@ min_keep = 3
             .expect("config has a parent")
             .join("locks")
     }
+
+    fn restore(&self, args: &[&str]) -> std::process::Output {
+        let mut cmd = self.dvb();
+        cmd.arg("restore").arg("db").args(args);
+        cmd.output().expect("run dvb restore")
+    }
 }
 
 /// Render `path` as a TOML basic string, including the surrounding quotes.
@@ -523,4 +529,241 @@ fn help_and_version_work_without_a_config() {
         .args(["backup", "--help"])
         .assert()
         .success();
+    AssertCommand::cargo_bin("dvb")
+        .expect("binary")
+        .args(["restore", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn round_trip_restore_preserves_tree_structure_modes_and_symlinks() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+
+    // 1. Setup source tree:
+    // - nested directory with file
+    // - executable file (0o755)
+    // - read-only file (0o600)
+    // - empty directory
+    // - symlink
+    let nested_dir = f.source.join("nested/inner");
+    std::fs::create_dir_all(&nested_dir).expect("create nested");
+    std::fs::write(nested_dir.join("file.txt"), b"nested content").expect("write nested file");
+
+    let bin_dir = f.source.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create bin");
+    let script = bin_dir.join("script.sh");
+    std::fs::write(&script, b"#!/bin/sh\necho hello\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+
+    let secret = f.source.join("secret.key");
+    std::fs::write(&secret, b"supersecret").expect("write secret");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod secret");
+
+    let empty = f.source.join("empty_dir");
+    std::fs::create_dir_all(&empty).expect("create empty");
+
+    let symlink = f.source.join("script_link");
+    std::os::unix::fs::symlink("bin/script.sh", &symlink).expect("symlink");
+
+    // 2. Perform backup
+    let backup_output = f.backup();
+    assert!(
+        backup_output.status.success(),
+        "backup failed: {backup_output:?}"
+    );
+
+    // 3. Restore to fresh target directory
+    let restore_target = f.source.parent().unwrap().join("restored_tree");
+    let target_str = restore_target.display().to_string();
+    let restore_output = f.restore(&["--to", &target_str]);
+    assert!(
+        restore_output.status.success(),
+        "restore failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&restore_output.stdout),
+        String::from_utf8_lossy(&restore_output.stderr)
+    );
+
+    // Stdout contract: single line with absolute extracted path
+    let stdout = String::from_utf8(restore_output.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), target_str);
+
+    // 4. Verify restored tree
+    let pgdata = restore_target.join("pgdata");
+    assert_eq!(
+        std::fs::read(pgdata.join("nested/inner/file.txt")).expect("read file"),
+        b"nested content"
+    );
+
+    let restored_script = pgdata.join("bin/script.sh");
+    assert_eq!(
+        std::fs::read(&restored_script).expect("read script"),
+        b"#!/bin/sh\necho hello\n"
+    );
+    let script_mode = std::fs::metadata(&restored_script)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(script_mode, 0o755);
+
+    let restored_secret = pgdata.join("secret.key");
+    assert_eq!(
+        std::fs::read(&restored_secret).expect("read secret"),
+        b"supersecret"
+    );
+    let secret_mode = std::fs::metadata(&restored_secret)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(secret_mode, 0o600);
+
+    assert!(pgdata.join("empty_dir").is_dir());
+    assert_eq!(
+        std::fs::read_dir(pgdata.join("empty_dir"))
+            .expect("read empty")
+            .count(),
+        0
+    );
+
+    let restored_symlink = pgdata.join("script_link");
+    assert!(
+        std::fs::symlink_metadata(&restored_symlink)
+            .expect("link meta")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_link(&restored_symlink).expect("symlink target"),
+        PathBuf::from("bin/script.sh")
+    );
+}
+
+#[test]
+fn restore_target_non_empty_without_force_fails_and_leaves_it_untouched() {
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"backup data").expect("write data");
+
+    let backup_output = f.backup();
+    assert!(backup_output.status.success());
+
+    let target = f.source.parent().unwrap().join("target_dir");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::write(target.join("keepme.txt"), b"preserve me").expect("write keepme");
+
+    // Restore without --force fails
+    let target_str = target.display().to_string();
+    let res = f.restore(&["--to", &target_str]);
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("not empty") || stderr.contains("pass `--force`"),
+        "{stderr}"
+    );
+
+    // Content untouched
+    assert_eq!(
+        std::fs::read(target.join("keepme.txt")).unwrap(),
+        b"preserve me"
+    );
+    assert!(!target.join("pgdata").exists());
+
+    // Restore with --force succeeds
+    let res = f.restore(&["--to", &target_str, "--force"]);
+    assert!(res.status.success(), "force restore failed: {stderr}");
+    assert_eq!(
+        std::fs::read(target.join("keepme.txt")).unwrap(),
+        b"preserve me"
+    );
+    assert!(target.join("pgdata/data.txt").exists());
+}
+
+#[test]
+fn restore_truncated_archive_leaves_no_staging_and_no_target() {
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"sample data").expect("write data");
+
+    let backup_output = f.backup();
+    assert!(backup_output.status.success());
+
+    // Truncate the backup archive
+    let backup_path = f.only_object().expect("backup object");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&backup_path)
+        .expect("open");
+    file.set_len(50).expect("truncate");
+
+    let target = f.source.parent().unwrap().join("fail_target");
+    let target_str = target.display().to_string();
+    let staging = PathBuf::from(format!("{target_str}.dvb-partial"));
+
+    let res = f.restore(&["--to", &target_str]);
+    assert!(!res.status.success());
+
+    // Staging and target must not exist
+    assert!(
+        !target.exists(),
+        "target directory should not exist on failure"
+    );
+    assert!(
+        !staging.exists(),
+        "staging directory should be cleaned up on failure"
+    );
+}
+
+#[test]
+fn restore_dry_run_outputs_plan_and_changes_nothing() {
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"test").expect("write");
+
+    let backup_output = f.backup();
+    assert!(backup_output.status.success());
+
+    let target = f.source.parent().unwrap().join("dry_target");
+    let target_str = target.display().to_string();
+
+    let res = f.restore(&["--to", &target_str, "--dry-run"]);
+    assert!(res.status.success());
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(stdout.contains("job: db"));
+    assert!(stdout.contains("backup: backups/"));
+    assert!(stdout.contains(&format!("target dir: {target_str}")));
+    assert!(stdout.contains("script: none"));
+
+    assert!(!target.exists());
+}
+
+#[test]
+fn restore_lock_prevents_concurrent_operations() {
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"test").expect("write");
+    assert!(f.backup().status.success());
+
+    let target = f.source.parent().unwrap().join("lock_target");
+    let target_str = target.display().to_string();
+
+    // Hold the lock in this process
+    std::fs::create_dir_all(f.lock_dir()).expect("mkdir locks");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(f.lock_dir().join("db.lock"))
+        .expect("open lock");
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.try_write().expect("acquire lock");
+
+    // Concurrent restore must fail fast
+    let res = f.restore(&["--to", &target_str]);
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(stderr.contains("already locked"), "{stderr}");
+    assert!(!target.exists());
 }

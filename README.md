@@ -16,14 +16,14 @@ each phase.
 |---|---|
 | `dvb run` | Run the scheduler daemon and execute jobs on their cron schedules |
 | `dvb backup <job>` | Archive the job's sources to storage, right now |
+| `dvb restore <job>` | Download and extract a backup to a directory safely |
 | `dvb list <job>` | List stored backups with their size and parsed timestamp |
 | `dvb prune <job> [--dry-run]` | Apply the retention policy without a new backup |
 | `dvb check` | Validate the config and round-trip each backend |
 
 Exit codes: `0` success, `1` failure, `2` partial — the archive reached storage
-but a post hook or the retention pass failed. A failed run never leaves a
-partial object behind, so a truncated archive cannot be mistaken for a good
-backup.
+but a post hook or the retention pass failed, `3` restore extracted OK but the script failed.
+A failed run never leaves a partial object behind, so a truncated archive cannot be mistaken for a good backup.
 
 ## Quick Start
 
@@ -274,17 +274,19 @@ drift apart:
 
 ```sh
 scripts/build-image.sh [-t TAG] [--no-cache]   # build the container image
-scripts/run-tests.sh [-j N] [--all]            # run the suite under cargo-nextest
+scripts/test.sh [-j N] [--all]                 # run the suite under cargo-nextest
 ```
 
-`run-tests.sh` defaults to `-j 1`, one test at a time, because the
+> **Note:** Always use `scripts/test.sh` (or `make test`) instead of raw `cargo test`. `scripts/test.sh` runs the test suite with `cargo-nextest` in serial execution (`-j 1` by default) to prevent container test OOM and port contention on smaller machines.
+
+`test.sh` defaults to `-j 1`, one test at a time, because the
 container-backed tests each start a real server and running several at once is
 the easy way to OOM a small machine. Raise it when the machine can take it:
 
 ```sh
-scripts/run-tests.sh -j 4        # four tests at a time
-scripts/run-tests.sh --all -j 2  # plus the containers, two at a time
-make test JOBS=4 ALL=1           # the same through make
+scripts/test.sh -j 4        # four tests at a time
+scripts/test.sh --all -j 2  # plus the containers, two at a time
+make test JOBS=4 ALL=1      # the same through make
 ```
 
 TLS is rustls throughout. `openssl-probe` shows up in `cargo tree` as a
@@ -297,10 +299,10 @@ The S3, SFTP and Docker tests need Docker and are `#[ignore]`d; `--all` (or
 `make test-all`) runs them:
 
 ```sh
-scripts/run-tests.sh --all                      # everything, serially
-cargo test --test s3_test -- --ignored         # just the SeaweedFS gateway
-cargo test --test sftp -- --ignored             # just atmoz/sftp
-cargo test --test docker_hooks -- --ignored     # stop/start, hooks, SIGTERM
+scripts/test.sh --all                           # everything, serially
+scripts/test.sh s3_test                         # just the SeaweedFS gateway
+scripts/test.sh sftp                            # just atmoz/sftp
+scripts/test.sh docker_hooks                    # stop/start, hooks, SIGTERM
 ```
 
 `docker_hooks` proves the parts a unit test cannot: that `State.StartedAt`

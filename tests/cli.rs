@@ -10,7 +10,7 @@ fn dvb() -> Command {
 fn help_lists_every_subcommand() {
     let output = dvb().arg("--help").assert().success();
     let stdout = String::from_utf8(output.get_output().stdout.clone()).expect("utf-8 stdout");
-    for subcommand in ["run", "backup", "prune", "list", "check"] {
+    for subcommand in ["run", "backup", "prune", "list", "check", "restore"] {
         assert!(
             stdout.contains(subcommand),
             "`{subcommand}` missing from help output:\n{stdout}"

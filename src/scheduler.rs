@@ -499,6 +499,7 @@ mod tests {
             pre: vec![],
             post: vec![],
             run_on_start,
+            restore: None,
         }
     }
 

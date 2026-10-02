@@ -86,6 +86,7 @@ fn job(source: PathBuf, root: PathBuf) -> JobConfig {
         pre: Vec::new(),
         post: Vec::new(),
         run_on_start: false,
+        restore: None,
     }
 }
 

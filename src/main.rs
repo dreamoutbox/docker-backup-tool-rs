@@ -10,7 +10,7 @@
 mod cli;
 
 use dvb::config::{self, Config, JobConfig};
-use dvb::{docker, error, job, retention, scheduler, storage};
+use dvb::{docker, error, job, restore, retention, scheduler, storage};
 
 use std::io::IsTerminal as _;
 use std::path::Path;
@@ -69,6 +69,43 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
         Command::Prune { job, dry_run } => prune(&cli.global, job, *dry_run).await,
         Command::List { job } => list(&cli.global, job).await,
         Command::Check => check(&cli.global).await,
+        Command::Restore {
+            job,
+            name,
+            at,
+            to,
+            script,
+            script_timeout,
+            force,
+            cleanup,
+            stop_containers,
+            no_verify,
+            dry_run,
+            preserve_owner,
+            max_extracted_bytes,
+            extra_args,
+        } => {
+            restore(
+                &cli.global,
+                job,
+                restore::RestoreOptions {
+                    name: name.clone(),
+                    at: at.clone(),
+                    to: to.clone(),
+                    script: script.clone(),
+                    script_timeout: *script_timeout,
+                    force: *force,
+                    cleanup: *cleanup,
+                    stop_containers: *stop_containers,
+                    no_verify: *no_verify,
+                    dry_run: *dry_run,
+                    preserve_owner: *preserve_owner,
+                    max_extracted_bytes: *max_extracted_bytes,
+                    extra_args: extra_args.clone(),
+                },
+            )
+            .await
+        }
     };
 
     outcome
@@ -153,6 +190,24 @@ async fn list(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
     Ok(EXIT_SUCCESS)
 }
 
+/// `dvb restore <job>`: download and safely extract a backup.
+async fn restore(
+    global: &GlobalArgs,
+    job_name: &str,
+    options: restore::RestoreOptions,
+) -> error::Result<u8> {
+    let config = Config::load(&global.config)?;
+    let job = config.job(job_name)?;
+    let op = storage::operator(&job.storage)?;
+
+    let path = restore::run_restore(&op, job, &options).await?;
+    if !options.dry_run {
+        println!("{}", path.display());
+    }
+
+    Ok(EXIT_SUCCESS)
+}
+
 /// `dvb check`: validate the config, then prove each backend works.
 ///
 /// Storage is checked with a real round trip (write, read, delete) rather than
@@ -203,6 +258,12 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
         }
 
         failures += check_containers(docker.as_ref(), job).await;
+
+        if let Some(restore) = &job.restore
+            && let Some(dir) = &restore.dir
+        {
+            check_restore_dir(dir);
+        }
     }
 
     if failures > 0 {
@@ -316,11 +377,44 @@ async fn check_containers(client: Option<&docker::Client>, job: &JobConfig) -> u
     failures
 }
 
+/// Report whether the restore base directory is writable.
+fn check_restore_dir(dir: &Path) {
+    let mut check_path = dir;
+    while !check_path.exists() {
+        if let Some(parent) = check_path.parent() {
+            check_path = parent;
+        } else {
+            break;
+        }
+    }
+    let probe = check_path.join(format!(".dvb-check-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            println!("  restore dir: ok ({})", dir.display());
+        }
+        Err(err) => {
+            println!(
+                "  warning: restore base dir `{}` is not writable: {err}",
+                dir.display()
+            );
+        }
+    }
+}
+
 /// Short description of what was attempted, used as error context.
 fn describe(command: &Command) -> String {
     match command {
         Command::Run => "daemon run failed".to_owned(),
-        Command::Backup { job } | Command::Prune { job, .. } | Command::List { job } => {
+        Command::Backup { job }
+        | Command::Prune { job, .. }
+        | Command::List { job }
+        | Command::Restore { job, .. } => {
             format!("job `{job}` failed")
         }
         Command::Check => "configuration check failed".to_owned(),
@@ -399,6 +493,25 @@ mod tests {
         assert_eq!(
             describe(&Command::List {
                 job: "pg".to_owned()
+            }),
+            "job `pg` failed"
+        );
+        assert_eq!(
+            describe(&Command::Restore {
+                job: "pg".to_owned(),
+                name: None,
+                at: None,
+                to: None,
+                script: None,
+                script_timeout: None,
+                force: false,
+                cleanup: true,
+                stop_containers: false,
+                no_verify: false,
+                dry_run: false,
+                preserve_owner: false,
+                max_extracted_bytes: None,
+                extra_args: vec![],
             }),
             "job `pg` failed"
         );
