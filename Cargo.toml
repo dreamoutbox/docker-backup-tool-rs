@@ -1,6 +1,34 @@
 [package]
-name = "docker-backup-tool-rs"
+name = "dvb"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Docker volume backup tool: tar+compress mounted paths and stream them to object storage"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
+# Phase 0 dependencies. Later phases add storage/cron/docker/archive crates.
+clap = { version = "=4.6.7", features = ["derive", "env"] }
+thiserror = "=2.0.21"
+anyhow = "=1.0.104"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# NOTE: `panic = "abort"` is intentionally NOT set. Cleanup guards (stop guards,
+# temp file removal) rely on unwinding.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+assert_cmd = "=2.2.2"
+predicates = "=3.1.4"

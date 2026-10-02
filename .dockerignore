@@ -1,0 +1,21 @@
+# Keep the build context small: dependencies are rebuilt from Cargo.lock by
+# cargo-chef, so neither the local build cache nor VCS metadata is needed.
+target/
+.git/
+.gitignore
+
+# Docs are not needed to build the image (README is kept for image metadata).
+*.md
+!README.md
+
+# Local compose/development files.
+docker-compose*.yml
+docker-compose*.yaml
+compose*.yml
+compose*.yaml
+
+# Editor / OS noise
+.idea/
+.vscode/
+**/*.rs.bk
+.DS_Store
