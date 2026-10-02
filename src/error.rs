@@ -13,6 +13,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Exit code returned for a plain failure.
 pub const EXIT_FAILURE: u8 = 1;
 
+/// Exit code returned when the work succeeded but a follow-up step did not.
+///
+/// For a backup that means: the archive is stored, but pruning or a post hook
+/// failed. The caller can treat the backup as valid.
+pub const EXIT_PARTIAL: u8 = 2;
+
 /// Every error this crate can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

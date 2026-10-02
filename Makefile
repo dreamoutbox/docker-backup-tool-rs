@@ -1,8 +1,12 @@
 IMAGE ?= dvb:latest
 DOCKER ?= docker
 CARGO ?= cargo
+# Tests run one at a time by default; raise it on a machine that can take it.
+JOBS ?= 1
+# 1 = include the #[ignore]d container-backed tests.
+ALL ?= 0
 
-.PHONY: help fmt lint test check build docker-build docker-build-cache clean all
+.PHONY: help fmt lint test test-all check build docker-build docker-build-cache openssl-check clean all
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -15,22 +19,22 @@ fmt: ## Format the code
 check: ## Format check + clippy (deny warnings) + tests
 	$(CARGO) fmt --check
 	$(CARGO) clippy --all-targets -- -D warnings
-	$(CARGO) test --all-targets
+	$(MAKE) test
 
 lint: ## Clippy only
 	$(CARGO) clippy --all-targets -- -D warnings
 
-test: ## Run the test suite (testcontainer tests are #[ignore]d)
-	$(CARGO) test --all-targets
+test: ## Run the suite serially (nextest, -j $(JOBS))
+	./scripts/run-tests.sh -j $(JOBS) $(if $(filter 1,$(ALL)),--all)
 
-test-all: ## Run the test suite including testcontainer-backed tests
-	$(CARGO) test --all-targets -- --ignored
+test-all: ## Run the suite including the testcontainer-backed tests
+	./scripts/run-tests.sh -j $(JOBS) --all
 
 build: ## Release build of the dvb binary
 	$(CARGO) build --release --locked --bin dvb
 
 docker-build: ## Build the container image
-	$(DOCKER) build -t $(IMAGE) .
+	./scripts/build-image.sh -t $(IMAGE)
 
 docker-build-cache: ## Plain-cache build (deps cached in layers by cargo-chef)
 	$(DOCKER) build --no-cache-filter -t $(IMAGE) .

@@ -14,7 +14,7 @@ use crate::lock::JobLock;
 use crate::storage::{self, WriterSink};
 
 /// Outcome of one successful backup run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct BackupOutcome {
     /// Job name.
     pub job: String,
@@ -26,6 +26,11 @@ pub struct BackupOutcome {
     pub stats: ArchiveStats,
     /// How long the whole run took.
     pub duration: std::time::Duration,
+    /// What retention did afterwards, or why it failed.
+    ///
+    /// An error here means the backup is fine but rotation did not complete:
+    /// the caller should report partial success rather than failure.
+    pub prune: Result<crate::retention::PrunePlan>,
 }
 
 /// Build the [`Source`] list for a job.
@@ -116,12 +121,31 @@ async fn run_backup_locked(
                 elapsed_secs = started.elapsed().as_secs_f64(),
                 "backup uploaded"
             );
+
+            // Pruning only runs once the new backup is safely stored, so a
+            // failed upload can never delete the backup it would have replaced.
+            // A prune failure does not invalidate the backup: it is reported
+            // separately so the caller can exit 2 ("partial").
+            let prune = match crate::retention::prune(op, job, now, false).await {
+                Ok(plan) => {
+                    if plan.delete_count() > 0 {
+                        tracing::info!(deleted = plan.delete_count(), "pruned old backups");
+                    }
+                    Ok(plan)
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "prune failed after a successful backup");
+                    Err(err)
+                }
+            };
+
             Ok(BackupOutcome {
                 job: job.name.clone(),
                 object: remote,
                 size: meta.content_length(),
                 stats,
                 duration: started.elapsed(),
+                prune,
             })
         }
         Err(err) => {

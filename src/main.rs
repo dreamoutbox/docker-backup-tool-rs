@@ -20,7 +20,7 @@ use chrono::Utc;
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, GlobalArgs, LogFormat};
-use dvb::error::{EXIT_FAILURE, Error};
+use dvb::error::{EXIT_FAILURE, EXIT_PARTIAL, Error};
 
 /// Exit code for a completed command.
 const EXIT_SUCCESS: u8 = 0;
@@ -75,14 +75,24 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
 }
 
 /// `dvb backup <job>`: one archive, streamed to storage, right now.
+///
+/// Returns exit code 2 when the archive was uploaded but retention failed, so a
+/// caller can tell "the backup is safe but rotation needs attention" apart from
+/// a hard failure.
 async fn backup(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
     let config = Config::load(&global.config)?;
     let job = config.job(job_name)?;
 
     let op = storage::operator(&job.storage)?;
-    job::run_backup(&op, job, Utc::now()).await?;
+    let outcome = job::run_backup(&op, job, Utc::now()).await?;
 
-    Ok(EXIT_SUCCESS)
+    match outcome.prune {
+        Ok(_) => Ok(EXIT_SUCCESS),
+        Err(err) => {
+            tracing::error!("the backup succeeded but pruning did not: {err}");
+            Ok(EXIT_PARTIAL)
+        }
+    }
 }
 
 /// `dvb prune <job> [--dry-run]`: apply retention without a new backup.
