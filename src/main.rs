@@ -9,18 +9,20 @@
 
 mod cli;
 
-use dvb::config::{self, Config};
-use dvb::{error, job, retention, storage};
+use dvb::config::{self, Config, JobConfig};
+use dvb::{docker, error, job, retention, storage};
 
 use std::io::IsTerminal as _;
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use chrono::Utc;
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, GlobalArgs, LogFormat};
-use dvb::error::{EXIT_FAILURE, EXIT_PARTIAL, Error};
+use dvb::error::{EXIT_FAILURE, Error};
 
 /// Exit code for a completed command.
 const EXIT_SUCCESS: u8 = 0;
@@ -76,23 +78,22 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
 
 /// `dvb backup <job>`: one archive, streamed to storage, right now.
 ///
-/// Returns exit code 2 when the archive was uploaded but retention failed, so a
-/// caller can tell "the backup is safe but rotation needs attention" apart from
-/// a hard failure.
+/// Returns exit code 2 when the archive was uploaded but a post hook or
+/// retention failed, and 1 when a container could not be restarted, so a caller
+/// can tell "safe but needs attention" apart from a hard failure.
 async fn backup(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
     let config = Config::load(&global.config)?;
     let job = config.job(job_name)?;
 
     let op = storage::operator(&job.storage)?;
-    let outcome = job::run_backup(&op, job, Utc::now()).await?;
+    let run = job::RunContext::for_job(config.docker.socket.as_deref(), job)?;
+    // SIGINT/SIGTERM unwind through the pipeline instead of killing the
+    // process: containers come back up and the partial object is removed.
+    run.shutdown.install();
 
-    match outcome.prune {
-        Ok(_) => Ok(EXIT_SUCCESS),
-        Err(err) => {
-            tracing::error!("the backup succeeded but pruning did not: {err}");
-            Ok(EXIT_PARTIAL)
-        }
-    }
+    Ok(job::run_backup(&op, job, Utc::now(), &run)
+        .await?
+        .exit_code())
 }
 
 /// `dvb prune <job> [--dry-run]`: apply retention without a new backup.
@@ -156,7 +157,8 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
     println!("configuration at {} is valid", global.config.display());
     println!("{} job(s) defined", config.job_count());
 
-    let mut failures = 0_usize;
+    let (docker, mut failures) = check_socket(config.docker.socket.as_deref()).await;
+
     for job in &config.jobs {
         println!("\njob `{}` ({} backend)", job.name, job.storage.kind());
 
@@ -193,6 +195,8 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
                 failures += 1;
             }
         }
+
+        failures += check_containers(docker.as_ref(), job).await;
     }
 
     if failures > 0 {
@@ -200,6 +204,110 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
     }
     println!("\nall checks passed");
     Ok(EXIT_SUCCESS)
+}
+
+/// Connect to and ping the configured Docker socket.
+///
+/// Returns the client to reuse for the per-job checks plus how many failures it
+/// counted. No socket configured is not a failure: container control is
+/// optional, and jobs that need it are rejected when the config is loaded.
+async fn check_socket(socket: Option<&Path>) -> (Option<docker::Client>, usize) {
+    let Some(path) = socket else {
+        println!("\ndocker socket: not configured (container control disabled)");
+        return (None, 0);
+    };
+
+    let outcome = async {
+        let client = docker::Client::connect(path)?;
+        client.ping().await?;
+        Ok::<_, Error>(client)
+    }
+    .await;
+
+    match outcome {
+        Ok(client) => {
+            println!("\ndocker socket: ok ({})", path.display());
+            (Some(client), 0)
+        }
+        Err(err) => {
+            println!("\ndocker socket: FAILED: {err}");
+            (None, 1)
+        }
+    }
+}
+
+/// Report whether the job's containers resolve, and dry-run each container hook.
+///
+/// The dry run is `true` inside the target container: it proves the socket can
+/// exec there, which is the part that only fails at backup time otherwise.
+///
+/// Returns how many checks failed.
+async fn check_containers(client: Option<&docker::Client>, job: &JobConfig) -> usize {
+    let hooks = job
+        .pre
+        .iter()
+        .map(|hook| ("pre", hook))
+        .chain(job.post.iter().map(|hook| ("post", hook)))
+        .filter(|(_, hook)| hook.container.is_some());
+
+    if !job.needs_docker() {
+        return 0;
+    }
+
+    let Some(client) = client else {
+        println!("  containers: FAILED: no reachable [docker] socket");
+        return 1;
+    };
+
+    let mut failures = 0_usize;
+
+    match client
+        .resolve(&job.stop_containers, job.stop_label.as_deref())
+        .await
+    {
+        Ok(found) => println!("  containers: ok ({} matched)", found.len()),
+        Err(err) => {
+            println!("  containers: FAILED: {err}");
+            failures += 1;
+        }
+    }
+
+    for (phase, hook) in hooks {
+        let Some(container) = hook.container.as_deref() else {
+            continue;
+        };
+        let label = format!("{phase} hook `{}`", hook.cmd.join(" "));
+        let timeout = Duration::from_secs(hook.timeout_secs.min(30));
+
+        match client.resolve(&[container.to_owned()], None).await {
+            Err(err) => {
+                println!("  {label}: FAILED: {err}");
+                failures += 1;
+            }
+            Ok(found) if found.is_empty() || !found[0].running => {
+                println!(
+                    "  {label}: skipped (container `{container}` is not running), \
+                     cannot dry-run it now"
+                );
+            }
+            Ok(_) => {
+                let probe = ["true"].map(str::to_owned);
+                match client.exec(container, &probe, &[], timeout).await {
+                    Ok(0) => println!("  {label}: exec ok"),
+                    Ok(code) => {
+                        println!("  {label}: FAILED: `true` exited {code}");
+                        failures += 1;
+                    }
+                    Err(err) => {
+                        println!("  {label}: FAILED: {err}");
+                        failures += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    failures
 }
 
 /// Short description of what was attempted, used as error context.
@@ -265,6 +373,7 @@ mod tests {
     fn exit_codes_match_the_specification() {
         assert_eq!(EXIT_SUCCESS, 0);
         assert_eq!(error::EXIT_FAILURE, 1);
+        assert_eq!(error::EXIT_PARTIAL, 2);
     }
 
     #[test]

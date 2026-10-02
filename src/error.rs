@@ -13,6 +13,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Exit code returned for a plain failure.
 pub const EXIT_FAILURE: u8 = 1;
 
+/// Exit code returned when everything the command set out to do succeeded.
+pub const EXIT_SUCCESS: u8 = 0;
+
 /// Exit code returned when the work succeeded but a follow-up step did not.
 ///
 /// For a backup that means: the archive is stored, but pruning or a post hook
@@ -70,6 +73,24 @@ pub enum Error {
     /// `dvb check` found at least one broken job.
     #[error("{failures} check(s) failed")]
     CheckFailed { failures: usize },
+
+    /// The Docker API could not be reached, or refused an operation.
+    #[error("docker: {0}")]
+    Docker(String),
+
+    /// A pre or post hook did not succeed.
+    ///
+    /// `reason` is free-form because it spans three different failures: a
+    /// non-zero exit, a timeout, and a spawn error.
+    #[error("hook `{hook}` failed: {reason}")]
+    HookFailed { hook: String, reason: String },
+
+    /// A shutdown signal arrived and the run was abandoned.
+    ///
+    /// Cleanup has already happened by the time this is returned: containers
+    /// are restarted and the partial object is removed.
+    #[error("interrupted by {signal}")]
+    Cancelled { signal: &'static str },
 }
 
 /// Errors raised while loading or validating the configuration file.

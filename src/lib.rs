@@ -5,10 +5,13 @@
 
 pub mod archive;
 pub mod config;
+pub mod docker;
 pub mod error;
+pub mod hooks;
 pub mod job;
 pub mod lock;
 pub mod retention;
+pub mod signal;
 pub mod storage;
 
 #[cfg(test)]

@@ -200,7 +200,7 @@ Acceptance criteria:
 
 ---
 
-## Phase 2: S3 and SFTP backends, retention, list/prune
+## Phase 2: S3 and SFTP backends, retention, list/prune (DONE)
 
 Goal: real remote storage and rotation.
 
@@ -225,7 +225,7 @@ Acceptance criteria:
 
 ---
 
-## Phase 3: Docker integration and hooks
+## Phase 3: Docker integration and hooks (DONE)
 
 Goal: consistent backups through container stop/start and pre/post commands.
 

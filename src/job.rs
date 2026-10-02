@@ -1,7 +1,17 @@
 //! Job orchestration.
 //!
-//! Phase 1 scope: acquire the lock, stream the archive to storage, release the
-//! lock. Container stop/start, hooks and pruning are added in later phases.
+//! The pipeline, in order:
+//!
+//! ```text
+//! acquire lock
+//!  -> pre hooks            (failure aborts; post hooks still run with status=failure)
+//!  -> stop containers      (only those that were running)
+//!  -> archive + upload     (streamed; abortable by SIGINT/SIGTERM)
+//!  -> restore containers   (ALWAYS, before post hooks and prune)
+//!  -> post hooks           (filtered by run_on)
+//!  -> prune                (only if the upload succeeded)
+//! release lock
+//! ```
 
 use chrono::{DateTime, Utc};
 use opendal::Operator;
@@ -9,11 +19,18 @@ use tracing::Instrument as _;
 
 use crate::archive::{self, ArchiveOptions, ArchiveStats, Source};
 use crate::config::JobConfig;
-use crate::error::Result;
+use crate::docker::{self, StopGuard};
+use crate::error::{Error, Result};
+use crate::hooks::{self, Context, Phase, Status};
 use crate::lock::JobLock;
+use crate::signal::Shutdown;
 use crate::storage::{self, WriterSink};
 
-/// Outcome of one successful backup run.
+/// Outcome of one backup run that got as far as storing its archive.
+///
+/// Three steps can fail *after* the archive is safe, and each is reported
+/// separately: a failed restart is fatal, a failed post hook or prune only means
+/// the run was partial. See [`BackupOutcome::exit_code`].
 #[derive(Debug)]
 pub struct BackupOutcome {
     /// Job name.
@@ -26,11 +43,61 @@ pub struct BackupOutcome {
     pub stats: ArchiveStats,
     /// How long the whole run took.
     pub duration: std::time::Duration,
-    /// What retention did afterwards, or why it failed.
+    /// Whether every stopped container came back up.
     ///
-    /// An error here means the backup is fine but rotation did not complete:
-    /// the caller should report partial success rather than failure.
+    /// An error here means containers are still down, which is worse than a
+    /// missed rotation and takes priority over the other two.
+    pub restore: Result<()>,
+    /// What the post hooks did, or why the first one failed.
+    pub post: Result<()>,
+    /// What retention did afterwards, or why it failed.
     pub prune: Result<crate::retention::PrunePlan>,
+}
+
+impl BackupOutcome {
+    /// Exit code for a run that stored its archive.
+    ///
+    /// * `0` — everything succeeded
+    /// * `1` — a container was left stopped
+    /// * `2` — the archive is stored, but a post hook or pruning failed
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        if self.restore.is_err() {
+            crate::error::EXIT_FAILURE
+        } else if self.post.is_err() || self.prune.is_err() {
+            crate::error::EXIT_PARTIAL
+        } else {
+            crate::error::EXIT_SUCCESS
+        }
+    }
+}
+
+/// Per-run inputs that are neither the job nor its storage.
+///
+/// Built by the caller so the library never reaches for process configuration
+/// itself: the CLI resolves the Docker client from `[docker].socket`, tests
+/// leave it empty.
+#[derive(Debug, Default)]
+pub struct RunContext {
+    /// Fires on SIGINT/SIGTERM so the run can unwind through its cleanup.
+    pub shutdown: Shutdown,
+    /// Daemon handle. `None` for a job that needs no container control.
+    pub client: Option<docker::Client>,
+}
+
+impl RunContext {
+    /// Build the context for one job, connecting only if it needs Docker.
+    ///
+    /// # Errors
+    ///
+    /// When the job needs the daemon and `[docker].socket` is missing or cannot
+    /// be opened.
+    pub fn for_job(socket: Option<&std::path::Path>, job: &JobConfig) -> Result<Self> {
+        Ok(Self {
+            shutdown: Shutdown::new(),
+            client: docker::client_for(socket, job)?,
+        })
+    }
 }
 
 /// Build the [`Source`] list for a job.
@@ -54,17 +121,19 @@ pub fn archive_options(job: &JobConfig) -> ArchiveOptions {
 ///
 /// # Errors
 ///
-/// [`Error::Locked`] when another process holds the job lock,
-/// [`Error::Archive`] when a source cannot be read, and [`Error::Storage`] when
-/// the backend refuses an operation. Any failure after the upload started
-/// removes the partial object, so storage never holds a truncated archive that
-/// looks like a valid backup.
+/// [`Error::Locked`] when another process holds the job lock, [`Error::Archive`]
+/// when a source cannot be read, [`Error::Storage`] when the backend refuses an
+/// operation, [`Error::HookFailed`] when a pre hook fails, and
+/// [`Error::Cancelled`] when a shutdown signal arrives. Containers stopped for
+/// the run are restarted on every one of those paths before the error returns,
+/// and any failure after the upload started removes the partial object.
 pub async fn run_backup(
     op: &Operator,
     job: &JobConfig,
     now: DateTime<Utc>,
+    run: &RunContext,
 ) -> Result<BackupOutcome> {
-    try_run_backup(op, job, now, &crate::lock::lock_dir()).await
+    try_run_backup(op, job, now, &crate::lock::lock_dir(), run).await
 }
 
 /// [`run_backup`] taking the lock from an explicit directory.
@@ -81,11 +150,12 @@ pub async fn try_run_backup(
     job: &JobConfig,
     now: DateTime<Utc>,
     lock_dir: &std::path::Path,
+    run: &RunContext,
 ) -> Result<BackupOutcome> {
     let started = std::time::Instant::now();
     let _lock = JobLock::try_acquire_in(lock_dir, &job.name)?;
     let span = tracing::info_span!("job", job = %job.name);
-    run_backup_locked(op, job, now, started)
+    run_backup_locked(op, job, now, started, run)
         .instrument(span)
         .await
 }
@@ -96,6 +166,7 @@ async fn run_backup_locked(
     job: &JobConfig,
     now: DateTime<Utc>,
     started: std::time::Instant,
+    run: &RunContext,
 ) -> Result<BackupOutcome> {
     let backend = job.storage.kind();
     let object = job.object_name(now);
@@ -108,72 +179,215 @@ async fn run_backup_locked(
         "starting backup"
     );
 
-    let sources = sources(job);
-    let options = archive_options(job);
-    let result = upload(op, backend, &remote, sources, options).await;
+    let client = run.client.as_ref();
+    // Nothing is stopped yet, so a failure before step 2 has an empty guard.
+    let mut guard: Option<StopGuard> = None;
 
-    match result {
-        Ok((meta, stats)) => {
-            tracing::info!(
-                object = %remote,
-                bytes = meta.content_length(),
-                entries = stats.entries,
-                elapsed_secs = started.elapsed().as_secs_f64(),
-                "backup uploaded"
-            );
+    let hooks_ctx = |status, error| Context {
+        job: &job.name,
+        status,
+        archive: &remote,
+        error,
+    };
 
-            // Pruning only runs once the new backup is safely stored, so a
-            // failed upload can never delete the backup it would have replaced.
-            // A prune failure does not invalidate the backup: it is reported
-            // separately so the caller can exit 2 ("partial").
-            let prune = match crate::retention::prune(op, job, now, false).await {
-                Ok(plan) => {
-                    if plan.delete_count() > 0 {
-                        tracing::info!(deleted = plan.delete_count(), "pruned old backups");
-                    }
-                    Ok(plan)
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "prune failed after a successful backup");
-                    Err(err)
-                }
-            };
+    // 1. Pre hooks. A failure here means nothing has been stopped, and the post
+    //    hooks still get their turn with status=failure.
+    let pending = hooks_ctx(Status::Pending, "");
+    if let Err(err) = hooks::run(Phase::Pre, &job.pre, &pending, client).await {
+        tracing::error!(error = %err, "pre hook failed; the backup was not taken");
+        let failed_at = err.to_string();
+        abort(job, &remote, &mut guard, client, &failed_at).await;
+        return Err(err);
+    }
 
-            Ok(BackupOutcome {
-                job: job.name.clone(),
-                object: remote,
-                size: meta.content_length(),
-                stats,
-                duration: started.elapsed(),
-                prune,
-            })
+    // 2. Stop the containers this job selects, recording which were running.
+    if let Some(handle) = client.cloned() {
+        match StopGuard::stop(handle, job).await {
+            Ok(stopped) => guard = Some(stopped),
+            Err(err) => {
+                tracing::error!(error = %err, "could not stop the job's containers");
+                let failed_at = err.to_string();
+                abort(job, &remote, &mut guard, client, &failed_at).await;
+                return Err(err);
+            }
+        }
+    }
+
+    // 3. Archive and upload.
+    let uploaded = upload(
+        op,
+        backend,
+        &remote,
+        sources(job),
+        archive_options(job),
+        &run.shutdown,
+    )
+    .await;
+
+    // 4. Restart everything. ALWAYS, and before the post hooks and pruning:
+    //    a post hook may target the very containers that were stopped.
+    let restore = restore(&mut guard).await;
+
+    // 5. Post hooks, filtered by run_on.
+    let (hook_status, error) = match &uploaded {
+        Ok(_) => (Status::Success, String::new()),
+        Err(err) => (Status::Failure, err.to_string()),
+    };
+    let post = hooks::run(
+        Phase::Post,
+        &job.post,
+        &hooks_ctx(hook_status, &error),
+        client,
+    )
+    .await;
+    if let Err(err) = &post {
+        tracing::error!(error = %err, "a post hook failed after the backup");
+    }
+
+    let (meta, archive_stats) = match uploaded {
+        Ok(written) => written,
+        Err(err) => {
+            tracing::error!(object = %remote, error = %err, "backup failed");
+            return Err(err);
+        }
+    };
+
+    tracing::info!(
+        object = %remote,
+        bytes = meta.content_length(),
+        entries = archive_stats.entries,
+        elapsed_secs = started.elapsed().as_secs_f64(),
+        "backup uploaded"
+    );
+
+    // 6. Prune only now that the new backup is safely stored, so a failed
+    //    upload can never delete the backup it would have replaced.
+    let prune = prune_after_upload(op, job, now).await;
+
+    Ok(BackupOutcome {
+        job: job.name.clone(),
+        object: remote,
+        size: meta.content_length(),
+        stats: archive_stats,
+        duration: started.elapsed(),
+        restore,
+        post,
+        prune,
+    })
+}
+
+/// Apply retention once the new archive is in storage.
+///
+/// A failure here does not invalidate the backup, so it is logged and reported
+/// through [`BackupOutcome::prune`] for the caller to turn into exit code 2.
+async fn prune_after_upload(
+    op: &Operator,
+    job: &JobConfig,
+    now: DateTime<Utc>,
+) -> Result<crate::retention::PrunePlan> {
+    match crate::retention::prune(op, job, now, false).await {
+        Ok(plan) => {
+            if plan.delete_count() > 0 {
+                tracing::info!(deleted = plan.delete_count(), "pruned old backups");
+            }
+            Ok(plan)
         }
         Err(err) => {
-            // `upload` already cleaned up, but a failure between opening the
-            // writer and the first byte needs the same treatment.
-            tracing::error!(object = %remote, error = %err, "backup failed");
+            tracing::error!(error = %err, "prune failed after a successful backup");
+            Err(err)
+        }
+    }
+}
+
+/// Undo whatever has already happened and report the failure through the post
+/// hooks. Shared by the paths that fail before the archive is attempted.
+async fn abort(
+    job: &JobConfig,
+    remote: &str,
+    guard: &mut Option<StopGuard>,
+    client: Option<&docker::Client>,
+    reason: &str,
+) {
+    // `restore` logs its own failure; the caller is already returning the error
+    // that caused the abort, which is the more useful one.
+    let _ = restore(guard).await;
+    let ctx = Context {
+        job: &job.name,
+        status: Status::Failure,
+        archive: remote,
+        error: reason,
+    };
+    if let Err(err) = hooks::run(Phase::Post, &job.post, &ctx, client).await {
+        tracing::error!(error = %err, "a post hook failed after an aborted backup");
+    }
+}
+
+/// Take the guard and restart what it holds, leaving nothing behind to restore.
+///
+/// A failure is logged here rather than at each call site so no path can forget
+/// to mention that containers are still down.
+async fn restore(guard: &mut Option<StopGuard>) -> Result<()> {
+    let stopped = guard.take();
+    let Some(stopped) = stopped else {
+        return Ok(());
+    };
+    match stopped.restore().await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "containers may still be stopped; check them by hand"
+            );
             Err(err)
         }
     }
 }
 
 /// Stream the archive into `remote`, cleaning up on failure.
+///
+/// A shutdown signal abandons the stream the same way an error does: the
+/// archiver is dropped, the partial object is removed, and the caller is told
+/// which signal asked for it.
 async fn upload(
     op: &Operator,
     backend: &'static str,
     remote: &str,
     sources: Vec<Source>,
     options: ArchiveOptions,
+    shutdown: &Shutdown,
 ) -> Result<(opendal::Metadata, ArchiveStats)> {
     let writer = storage::new_writer(op, backend, remote).await?;
     let mut sink = WriterSink::new(writer, backend);
 
-    let stats = match archive::stream_to(sources, &mut sink, options).await {
-        Ok(stats) => stats,
-        Err(err) => {
+    // Scoped so the stream's borrow of `sink` ends before `abort` takes it.
+    // `biased` puts the shutdown first: once a signal has fired it wins over
+    // any chunk the archiver happens to be ready with.
+    let streamed = {
+        let stream = archive::stream_to(sources, &mut sink, options);
+        tokio::pin!(stream);
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => None,
+            result = &mut stream => Some(result),
+        }
+    };
+
+    let stats = match streamed {
+        Some(Ok(stats)) => stats,
+        Some(Err(err)) => {
             sink.abort().await;
             storage::cleanup_partial(op, backend, remote).await;
             return Err(err);
+        }
+        None => {
+            // The archiver is gone; drop its buffers before touching storage.
+            sink.abort().await;
+            storage::cleanup_partial(op, backend, remote).await;
+            return Err(Error::Cancelled {
+                signal: shutdown
+                    .signal()
+                    .map_or("shutdown", crate::signal::Signal::as_str),
+            });
         }
     };
 
@@ -253,10 +467,17 @@ mod tests {
         let now = Utc::now();
 
         let lock = JobLock::try_acquire_in(&tmp.path().join("locks"), &job.name).expect("lock");
-        let outcome = run_backup_locked(&op, &job, now, std::time::Instant::now())
-            .await
-            .expect("backup");
+        let outcome = run_backup_locked(
+            &op,
+            &job,
+            now,
+            std::time::Instant::now(),
+            &RunContext::default(),
+        )
+        .await
+        .expect("backup");
         assert_eq!(outcome.job, "db");
+        assert_eq!(outcome.exit_code(), crate::error::EXIT_SUCCESS);
         assert!(
             outcome.object.starts_with("backups/db-"),
             "{}",
@@ -296,7 +517,7 @@ mod tests {
         let job = job(tmp.path(), "db-%Y%m%dT%H%M%SZ");
         let op = storage::operator(&job.storage).expect("operator");
 
-        let err = try_run_backup(&op, &job, Utc::now(), &locks)
+        let err = try_run_backup(&op, &job, Utc::now(), &locks, &RunContext::default())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Archive { .. }), "got {err:?}");
@@ -318,14 +539,14 @@ mod tests {
 
         // A separate `docker exec dvb backup` holds the lock.
         let held = JobLock::try_acquire_in(&locks, "db").expect("hold the lock");
-        let err = try_run_backup(&op, &job, Utc::now(), &locks)
+        let err = try_run_backup(&op, &job, Utc::now(), &locks, &RunContext::default())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Locked { .. }), "got {err:?}");
 
         // Once released, the same run succeeds.
         drop(held);
-        try_run_backup(&op, &job, Utc::now(), &locks)
+        try_run_backup(&op, &job, Utc::now(), &locks, &RunContext::default())
             .await
             .expect("backup after release");
     }

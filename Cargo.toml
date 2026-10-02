@@ -53,6 +53,14 @@ flate2 = "=1.1.10"
 # Cross-process job locking
 fd-lock = "=4.0.4"
 
+# Docker control (phase 3): stop/start containers for consistency and run
+# container hooks. Default features are `http` + `pipe` - the unix socket and
+# plain HTTP transports - so no TLS stack is pulled in here.
+bollard = "=0.21.1"
+# Draining the attach stream from a container exec; already in the tree via
+# bollard, listed here because we name it directly.
+futures-util = "=0.3.34"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

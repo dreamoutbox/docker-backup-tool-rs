@@ -44,7 +44,6 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct DockerConfig {
     /// Path to the Docker unix socket. `None` disables container control.
-    #[allow(dead_code)] // read by docker.rs in phase 3
     #[serde(default)]
     pub socket: Option<PathBuf>,
 }
@@ -78,12 +77,10 @@ pub struct JobConfig {
     pub min_keep: u32,
 
     /// Container names to stop for consistency, then restart.
-    #[allow(dead_code)] // read by docker.rs in phase 3
     #[serde(default)]
     pub stop_containers: Vec<String>,
 
     /// Label selector (`key=value`) matching containers to stop.
-    #[allow(dead_code)] // read by docker.rs in phase 3
     #[serde(default)]
     pub stop_label: Option<String>,
 
@@ -176,16 +173,13 @@ impl Compression {
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
     /// Argument vector, executed without a shell.
-    #[allow(dead_code)] // read by hooks.rs in phase 3
     pub cmd: Vec<String>,
 
     /// When this hook should run (only meaningful for post hooks).
-    #[allow(dead_code)] // read by hooks.rs in phase 3
     #[serde(default)]
     pub run_on: RunOn,
 
     /// Container to run the hook in; `None` runs it locally.
-    #[allow(dead_code)] // read by hooks.rs in phase 3
     #[serde(default)]
     pub container: Option<String>,
 
@@ -463,6 +457,12 @@ impl Config {
                 return Err(invalid(format!("duplicate job name `{}`", job.name)));
             }
             job.validate()?;
+            if job.needs_docker() && self.docker.socket.is_none() {
+                return Err(invalid(format!(
+                    "job `{}` stops containers or runs a container hook, but [docker] socket is not set",
+                    job.name
+                )));
+            }
         }
         Ok(())
     }
@@ -571,10 +571,23 @@ impl JobConfig {
     }
 
     /// Whether this job wants containers stopped for consistency.
-    #[allow(dead_code)] // read by job.rs/docker.rs in phase 3
     #[must_use]
     pub fn wants_stop(&self) -> bool {
         !self.stop_containers.is_empty() || self.stop_label.is_some()
+    }
+
+    /// Whether this job needs the Docker socket at all.
+    ///
+    /// Stops, starts and container hooks all go through the daemon; a job with
+    /// none of those runs without one, which is what keeps `[docker]` optional.
+    #[must_use]
+    pub fn needs_docker(&self) -> bool {
+        self.wants_stop()
+            || self
+                .pre
+                .iter()
+                .chain(self.post.iter())
+                .any(|hook| hook.container.is_some())
     }
 
     /// Render the remote object name for `now`, in UTC.
@@ -1052,6 +1065,9 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn stop_configuration_is_detected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
+[docker]
+socket = "/var/run/docker.sock"
+
 [[job]]
 name = "db"
 source = ["/data"]
@@ -1066,9 +1082,38 @@ stop_containers = ["postgres"]
     }
 
     #[test]
+    fn a_job_that_needs_docker_requires_a_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+stop_containers = ["postgres"]
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let err = parse(body, dir.path()).expect_err("accepted a job with no socket");
+        assert!(err.to_string().contains("[docker]"), "{err}");
+
+        // The same job is fine once the socket is configured.
+        assert!(parse(&with_socket(body), dir.path()).is_ok());
+    }
+
+    /// The same TOML with a `[docker]` section, for a job that does need the
+    /// daemon to be reachable.
+    fn with_socket(body: &str) -> String {
+        format!("[docker]\nsocket = \"/var/run/docker.sock\"\n\n{body}")
+    }
+
+    #[test]
     fn hooks_round_trip_with_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
+[docker]
+socket = "/var/run/docker.sock"
+
 [[job]]
 name = "db"
 source = ["/data"]

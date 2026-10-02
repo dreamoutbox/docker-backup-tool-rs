@@ -17,7 +17,7 @@ each phase.
 | 0 | Project scaffold, CLI skeleton, Docker build | done |
 | 1 | Config, archiving, `fs` storage, job locks | done |
 | 2 | S3/SFTP backends, retention, `list`/`prune`/`check` | done |
-| 3 | Docker stop/start, pre/post hooks | not started |
+| 3 | Docker stop/start, pre/post hooks | done |
 | 4 | Scheduler daemon, graceful shutdown | not started |
 | 5 | Dropbox backend, `stage = "local"` | not started |
 
@@ -32,8 +32,10 @@ each phase.
 
 `dvb run` (the scheduler daemon) is not implemented yet.
 
-Exit codes: `0` success, `1` failure. A failed run never leaves a partial object
-behind, so a truncated archive cannot be mistaken for a good backup.
+Exit codes: `0` success, `1` failure, `2` partial — the archive reached storage
+but a post hook or the retention pass failed. A failed run never leaves a
+partial object behind, so a truncated archive cannot be mistaken for a good
+backup.
 
 ## Configuration
 
@@ -108,6 +110,81 @@ verification.
 Secrets in the config are wrapped in a redacting type: `Debug` and `Display`
 print `***redacted***`, so they cannot leak into logs or `dvb check` output.
 
+## Docker control and hooks
+
+Container control is optional, and a job that stops containers or runs a hook
+inside one needs the daemon's socket:
+
+```toml
+[docker]
+socket = "/var/run/docker.sock"
+```
+
+Validation rejects a job that needs the daemon without it, so a missing socket
+surfaces at load time rather than half way through a backup.
+
+### Stopping containers
+
+```toml
+[[job]]
+stop_containers = ["postgres", "api"]  # by name or id prefix
+stop_label = "dvb.stop"                # or by label: `key`, or `key=value`
+stop_timeout_secs = 30                 # SIGTERM grace period before SIGKILL
+```
+
+Both selectors may be given. Names match exactly: Docker's own name filter is a
+substring match, which would let a job asking for `db` silently pick up
+`db-archive`. A selector that matches nothing is an error, since it means the
+backup was taken without stopping anything.
+
+Only containers that were **running** when the run started are stopped, and only
+those are started again. Restart happens before the post hooks and before
+pruning, on every path out of a run: success, failure, abort and
+SIGINT/SIGTERM. A restart that fails is a hard failure (exit `1`), because
+containers left stopped are worse than a missed rotation.
+
+### Hooks
+
+```toml
+  [[job.pre]]
+  cmd = ["pg_dump", "-f", "/backup/pgdata/dump.sql"]
+  container = "postgres"      # omit to run on this machine
+  timeout_secs = 300          # SIGKILL once this elapses
+
+  [[job.post]]
+  cmd = ["/bin/notify.sh"]
+  run_on = "always"           # success (default) | failure | always
+```
+
+`cmd` is an argument vector and never a shell string: it runs the program
+directly. Anything that needs a shell says so itself with
+`cmd = ["/bin/sh", "-c", "..."]`. Naming a `container` without `[docker].socket`
+is a validation error.
+
+Pre hooks run first and stop at the first failure: no backup is taken, and the
+post hooks still run with `DVB_STATUS=failure`. Post hooks all get their turn,
+because they are cleaning up, and the first failure is reported.
+
+Every hook is handed:
+
+| Variable | Value |
+|---|---|
+| `DVB_JOB` | job name |
+| `DVB_STATUS` | `pending`, `success` or `failure` |
+| `DVB_ARCHIVE` | the object name the archive is going to |
+| `DVB_ERROR` | why the run failed, empty when it did not |
+
+Local hooks are killed when their timeout elapses and their output is forwarded
+to the log line by line. Container hooks run through `docker exec` and are
+judged by their exit code, which the API reports rather than raises.
+
+### Signals
+
+`SIGINT` and `SIGTERM` do not kill the process mid-upload. They cancel the run,
+which drops the archiver, removes the partial object, restarts whatever was
+stopped, runs the post hooks, and only then exits non-zero. A second signal
+cannot interrupt that cleanup.
+
 ## Retention
 
 A backup is deleted when it is both older than `retention_days` **and** outside
@@ -153,14 +230,22 @@ Windows-only helper of `rustls-native-certs` and links nothing on Linux, so
 
 ### Integration tests
 
-The S3 and SFTP tests need Docker and are `#[ignore]`d; `--all` (or
+The S3, SFTP and Docker tests need Docker and are `#[ignore]`d; `--all` (or
 `make test-all`) runs them:
 
 ```sh
 scripts/run-tests.sh --all                      # everything, serially
 cargo test --test s3_minio -- --ignored         # just the SeaweedFS gateway
 cargo test --test sftp -- --ignored             # just atmoz/sftp
+cargo test --test docker_hooks -- --ignored     # stop/start, hooks, SIGTERM
 ```
+
+`docker_hooks` proves the parts a unit test cannot: that `State.StartedAt`
+changes (so a container really was stopped and restarted, not merely left
+running), that a failed upload and a SIGTERM both restore it, and that a partial
+object is removed. Its test container traps SIGTERM, because as PID 1 a process
+ignores default signal dispositions and `docker stop` would otherwise wait out
+its whole timeout.
 
 They cap each container at 0.5 CPU and 512 MiB so a run cannot starve the
 machine. Override when a test is genuinely too slow under the cap:
