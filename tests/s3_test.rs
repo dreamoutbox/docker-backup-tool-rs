@@ -101,6 +101,7 @@ impl SeaweedS3 {
                 r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["{}"]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
 compression = "zstd"

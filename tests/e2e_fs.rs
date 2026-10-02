@@ -35,6 +35,7 @@ impl Fixture {
             r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = [{}]
 filename = "{filename}"
 compression = "{compression}"

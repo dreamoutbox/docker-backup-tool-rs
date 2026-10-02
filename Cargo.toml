@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/crontext"]
+
 [package]
 name = "dvb"
 version = "0.1.0"
@@ -11,6 +14,9 @@ readme = "README.md"
 # Every direct dependency is pinned with `=` so a rebuild cannot silently pick
 # up a new minor version. `cargo update -p <crate> --precise <version>` is how
 # bumps happen.
+
+# Workspace members
+crontext = { path = "crates/crontext" }
 
 # CLI and process plumbing
 clap = { version = "=4.6.7", features = ["derive", "env"] }

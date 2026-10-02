@@ -147,6 +147,16 @@ pub enum Command {
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
+
+    /// Parse and evaluate a human-friendly schedule expression.
+    Crontext {
+        /// Schedule expression (e.g. "every friday at 18:00").
+        expression: String,
+
+        /// Timezone to evaluate the schedule in (defaults to TZ or UTC).
+        #[arg(long, short)]
+        timezone: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -168,7 +178,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["run", "backup", "prune", "list", "check", "restore"]
+            [
+                "run", "backup", "prune", "list", "check", "restore", "crontext"
+            ]
         );
     }
 

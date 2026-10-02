@@ -1,0 +1,12 @@
+[package]
+name = "crontext"
+version = "0.1.0"
+edition = "2024"
+description = "Human-friendly schedule parser for cron"
+license = "MIT"
+
+[dependencies]
+thiserror = "=2.0.21"
+
+[dev-dependencies]
+croner = "=4.0.0"

@@ -412,6 +412,9 @@ mod tests {
         JobConfig {
             name: "db".to_owned(),
             cron: Some("0 3 * * *".to_owned()),
+            crontext: None,
+            timezone: None,
+            schedule_source: Some(crate::config::ScheduleSource::Cron),
             source: vec![root.join("data")],
             filename: filename.to_owned(),
             compression: Compression::Zstd,

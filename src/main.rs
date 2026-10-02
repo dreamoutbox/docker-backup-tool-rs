@@ -9,7 +9,7 @@
 
 mod cli;
 
-use dvb::config::{self, Config, JobConfig};
+use dvb::config::{self, Config, JobConfig, ScheduleSource};
 use dvb::{docker, error, job, restore, retention, scheduler, signal, storage};
 
 use std::io::IsTerminal as _;
@@ -69,6 +69,10 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
         Command::Prune { job, dry_run } => prune(&cli.global, job, *dry_run).await,
         Command::List { job } => list(&cli.global, job).await,
         Command::Check => check(&cli.global).await,
+        Command::Crontext {
+            expression,
+            timezone,
+        } => crontext_cmd(expression, timezone.as_deref()),
         Command::Restore {
             job,
             name,
@@ -231,8 +235,29 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
 
     let (docker, mut failures) = check_socket(config.docker.socket.as_deref()).await;
 
+    let default_tz = scheduler::resolve_timezone()?;
     for job in &config.jobs {
+        let tz = job.effective_timezone(default_tz);
         println!("\njob `{}` ({} backend)", job.name, job.storage.kind());
+
+        if let Some(cron_str) = &job.cron {
+            let parsed_cron = config::parse_cron(cron_str).map_err(|err| {
+                Error::Config(dvb::error::ConfigError::Invalid(format!(
+                    "job `{}`: invalid cron `{cron_str}`: {err}",
+                    job.name
+                )))
+            })?;
+            let next = scheduler::next_fire_time(&parsed_cron, &tz, Utc::now(), None)?;
+            let source_desc = match &job.schedule_source {
+                Some(ScheduleSource::Crontext(orig)) => format!("crontext: \"{orig}\""),
+                _ => "cron".to_owned(),
+            };
+            println!(
+                "  schedule: {cron_str} (from {source_desc}) [{}]",
+                tz.name()
+            );
+            println!("  next run: {}", next.with_timezone(&tz).to_rfc3339());
+        }
 
         match storage::operator(&job.storage) {
             Ok(op) => match storage::probe(&op, job.storage.kind()).await {
@@ -281,6 +306,40 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
         return Err(Error::CheckFailed { failures });
     }
     println!("\nall checks passed");
+    Ok(EXIT_SUCCESS)
+}
+
+/// `dvb crontext`: evaluate a human-friendly schedule expression.
+fn crontext_cmd(expression: &str, tz_override: Option<&str>) -> error::Result<u8> {
+    let sched = crontext::parse(expression).map_err(|err| {
+        Error::Config(dvb::error::ConfigError::Invalid(format!(
+            "invalid crontext expression `{expression}`: {err}"
+        )))
+    })?;
+    let tz = match tz_override {
+        Some(s) => scheduler::resolve_timezone_from(Some(s))?,
+        None => scheduler::resolve_timezone()?,
+    };
+    let cron = config::parse_cron(&sched.cron).map_err(|err| {
+        Error::Config(dvb::error::ConfigError::Invalid(format!(
+            "resolved cron `{}` is invalid: {err}",
+            sched.cron
+        )))
+    })?;
+
+    println!("expression:  {expression}");
+    println!("cron:        {}", sched.cron);
+    println!("description: {}", sched.description);
+    println!("timezone:    {}", tz.name());
+    println!("next 5 fire times:");
+    let mut cursor = None;
+    let now = Utc::now();
+    for i in 1..=5 {
+        let next = scheduler::next_fire_time(&cron, &tz, now, cursor)?;
+        println!("  {i}. {}", next.with_timezone(&tz).to_rfc3339());
+        cursor = Some(next);
+    }
+
     Ok(EXIT_SUCCESS)
 }
 
@@ -429,6 +488,7 @@ fn describe(command: &Command) -> String {
             format!("job `{job}` failed")
         }
         Command::Check => "configuration check failed".to_owned(),
+        Command::Crontext { .. } => "crontext evaluation failed".to_owned(),
     }
 }
 
@@ -527,5 +587,12 @@ mod tests {
             "job `pg` failed"
         );
         assert_eq!(describe(&Command::Check), "configuration check failed");
+        assert_eq!(
+            describe(&Command::Crontext {
+                expression: "every day".to_owned(),
+                timezone: None,
+            }),
+            "crontext evaluation failed"
+        );
     }
 }

@@ -57,6 +57,7 @@ socket = "{}"
 
 [[job]]
 name = "{JOB}"
+cron = "0 3 * * *"
 source = [{}]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
 retention_days = 14

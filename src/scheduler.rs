@@ -45,18 +45,7 @@ pub fn resolve_timezone() -> Result<Tz> {
 /// Returns [`Error::Config`] if `tz_str` cannot be parsed as an IANA timezone name.
 pub fn resolve_timezone_from(tz_env: Option<&str>) -> Result<Tz> {
     match tz_env {
-        Some(tz_str) => {
-            let clean = tz_str.trim().strip_prefix(':').unwrap_or(tz_str.trim());
-            if clean.is_empty() {
-                Ok(chrono_tz::UTC)
-            } else {
-                clean.parse::<Tz>().map_err(|err| {
-                    Error::Config(ConfigError::Invalid(format!(
-                        "invalid TZ environment variable `{tz_str}`: {err}"
-                    )))
-                })
-            }
-        }
+        Some(tz_str) => crate::config::parse_timezone(tz_str),
         None => Ok(chrono_tz::UTC),
     }
 }
@@ -253,6 +242,90 @@ pub async fn run(config: Config) -> Result<u8> {
     run_scheduler(config, crate::lock::lock_dir(), daemon_shutdown).await
 }
 
+fn log_scheduled_jobs(jobs: &[JobConfig], tz: Tz) -> Result<()> {
+    tracing::info!(
+        jobs = jobs.len(),
+        tz = %tz.name(),
+        "starting scheduler daemon"
+    );
+
+    for job in jobs {
+        let job_tz = job.effective_timezone(tz);
+        if let Some(cron_str) = &job.cron {
+            let cron = config::parse_cron(cron_str).map_err(|err| {
+                Error::Config(ConfigError::Invalid(format!(
+                    "job `{}`: invalid cron `{cron_str}`: {err}",
+                    job.name
+                )))
+            })?;
+            let next = next_fire_time(&cron, &job_tz, Utc::now(), None)?;
+            if let Some(crate::config::ScheduleSource::Crontext(orig)) = &job.schedule_source {
+                tracing::info!(
+                    job = %job.name,
+                    cron = %cron_str,
+                    crontext = %orig,
+                    tz = %job_tz.name(),
+                    next_run = %next.to_rfc3339(),
+                    run_on_start = job.run_on_start,
+                    "scheduled job"
+                );
+            } else {
+                tracing::info!(
+                    job = %job.name,
+                    cron = %cron_str,
+                    tz = %job_tz.name(),
+                    next_run = %next.to_rfc3339(),
+                    run_on_start = job.run_on_start,
+                    "scheduled job"
+                );
+            }
+        } else {
+            tracing::info!(
+                job = %job.name,
+                run_on_start = job.run_on_start,
+                "job has no cron schedule; manual trigger only"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_graceful_shutdown(
+    active_jobs: &ActiveJobs,
+    job_shutdown: &Shutdown,
+    grace_secs: u64,
+    signal: Signal,
+) {
+    let running = active_jobs.count();
+    if running == 0 {
+        tracing::info!("no jobs running; shutdown complete");
+        return;
+    }
+
+    tracing::info!(
+        running,
+        grace_secs,
+        "waiting for running jobs to finish gracefully"
+    );
+
+    let grace_duration = Duration::from_secs(grace_secs);
+    tokio::select! {
+        () = active_jobs.wait_for_empty() => {
+            tracing::info!("all jobs finished gracefully");
+        }
+        () = tokio::time::sleep(grace_duration) => {
+            tracing::warn!(
+                grace_secs,
+                "grace period expired; cancelling remaining running jobs"
+            );
+            job_shutdown.cancel(signal);
+            // Allow cancelled jobs to finish their unwinding cleanup.
+            active_jobs.wait_for_empty().await;
+            tracing::info!("all jobs cleaned up and stopped");
+        }
+    }
+}
+
 /// Run the scheduler with an explicit lock directory and shutdown trigger.
 ///
 /// Used directly by integration tests to inject custom paths and simulate signals.
@@ -276,36 +349,7 @@ pub async fn run_scheduler(
     }
 
     // 2. Startup log: list all jobs with their next run time (Phase 4 Task 3).
-    tracing::info!(
-        jobs = config.jobs.len(),
-        tz = %tz.name(),
-        "starting scheduler daemon"
-    );
-
-    for job in &config.jobs {
-        if let Some(cron_str) = &job.cron {
-            let cron = config::parse_cron(cron_str).map_err(|err| {
-                Error::Config(ConfigError::Invalid(format!(
-                    "job `{}`: invalid cron `{cron_str}`: {err}",
-                    job.name
-                )))
-            })?;
-            let next = next_fire_time(&cron, &tz, Utc::now(), None)?;
-            tracing::info!(
-                job = %job.name,
-                cron = %cron_str,
-                next_run = %next.to_rfc3339(),
-                run_on_start = job.run_on_start,
-                "scheduled job"
-            );
-        } else {
-            tracing::info!(
-                job = %job.name,
-                run_on_start = job.run_on_start,
-                "job has no cron schedule; manual trigger only"
-            );
-        }
-    }
+    log_scheduled_jobs(&config.jobs, tz)?;
 
     let stop_scheduling = CancellationToken::new();
     let job_shutdown = Shutdown::new();
@@ -315,10 +359,11 @@ pub async fn run_scheduler(
     let docker_socket = config.docker.socket.clone();
 
     for (job, op) in config.jobs.into_iter().zip(operators) {
+        let job_tz = job.effective_timezone(tz);
         let ctx = JobSchedulerContext {
             job: Arc::new(job),
             op: Arc::new(op),
-            tz,
+            tz: job_tz,
             lock_dir: lock_dir.clone(),
             docker_socket: docker_socket.clone(),
             stop_token: stop_scheduling.clone(),
@@ -343,35 +388,13 @@ pub async fn run_scheduler(
     stop_scheduling.cancel();
 
     // 5. Graceful shutdown: wait for running jobs up to shutdown_grace_secs.
-    let running = active_jobs.count();
-    if running == 0 {
-        tracing::info!("no jobs running; shutdown complete");
-        return Ok(EXIT_SUCCESS);
-    }
-
-    let grace_secs = config.shutdown_grace_secs;
-    tracing::info!(
-        running,
-        grace_secs,
-        "waiting for running jobs to finish gracefully"
-    );
-
-    let grace_duration = Duration::from_secs(grace_secs);
-    tokio::select! {
-        () = active_jobs.wait_for_empty() => {
-            tracing::info!("all jobs finished gracefully");
-        }
-        () = tokio::time::sleep(grace_duration) => {
-            tracing::warn!(
-                grace_secs,
-                "grace period expired; cancelling remaining running jobs"
-            );
-            job_shutdown.cancel(signal);
-            // Allow cancelled jobs to finish their unwinding cleanup.
-            active_jobs.wait_for_empty().await;
-            tracing::info!("all jobs cleaned up and stopped");
-        }
-    }
+    wait_for_graceful_shutdown(
+        &active_jobs,
+        &job_shutdown,
+        config.shutdown_grace_secs,
+        signal,
+    )
+    .await;
 
     Ok(EXIT_SUCCESS)
 }
@@ -483,6 +506,9 @@ mod tests {
         JobConfig {
             name: name.to_owned(),
             cron: cron.map(str::to_owned),
+            crontext: None,
+            timezone: None,
+            schedule_source: cron.map(|_| crate::config::ScheduleSource::Cron),
             source: vec![PathBuf::from("/tmp")],
             filename: "backup-%Y%m%dT%H%M%SZ".to_owned(),
             compression: Compression::None,
@@ -738,5 +764,57 @@ mod tests {
             .await
             .expect("list");
         assert!(listed.is_empty(), "locked job should not write an object");
+    }
+
+    #[test]
+    fn dst_transition_every_12_hours_fires_at_local_times() {
+        use chrono::Datelike as _;
+        use chrono::Timelike as _;
+
+        // Schedule parsed from `every 12 hours`
+        let sched = crontext::parse("every 12 hours").expect("parse crontext");
+        assert_eq!(sched.cron, "0 */12 * * *");
+        let cron = config::parse_cron(&sched.cron).expect("parse cron");
+
+        let tz = chrono_tz::America::New_York;
+
+        // Spring forward in America/New_York occurred on Sunday, March 8, 2026:
+        // Clocks jumped from 02:00:00 to 03:00:00.
+        // Start before midnight on March 8:
+        let start_utc = chrono::DateTime::parse_from_rfc3339("2026-03-07T23:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut current_slot = None;
+        let mut sim_now = start_utc;
+
+        // Collect the next 4 occurrences across the DST spring-forward boundary
+        let mut local_fire_times = Vec::new();
+        for _ in 0..4 {
+            let next = next_fire_time(&cron, &tz, sim_now, current_slot).expect("next fire time");
+            let local = next.with_timezone(&tz);
+            local_fire_times.push(local);
+            current_slot = Some(next);
+            sim_now = next;
+        }
+
+        // Verify every fire occurrence is strictly at local minute 0 and hour 0 or 12
+        for (i, local) in local_fire_times.iter().enumerate() {
+            assert_eq!(local.minute(), 0, "fire #{i} minute must be 0: {local}");
+            assert!(
+                local.hour() == 0 || local.hour() == 12,
+                "fire #{i} hour must be 00:00 or 12:00 in America/New_York: {local}"
+            );
+        }
+
+        // Verify the sequence: 2026-03-08 00:00 EST -> 12:00 EDT -> 2026-03-09 00:00 EDT -> 12:00 EDT
+        assert_eq!(local_fire_times[0].hour(), 0);
+        assert_eq!(local_fire_times[0].day(), 8);
+        assert_eq!(local_fire_times[1].hour(), 12);
+        assert_eq!(local_fire_times[1].day(), 8);
+        assert_eq!(local_fire_times[2].hour(), 0);
+        assert_eq!(local_fire_times[2].day(), 9);
+        assert_eq!(local_fire_times[3].hour(), 12);
+        assert_eq!(local_fire_times[3].day(), 9);
     }
 }

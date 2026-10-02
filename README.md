@@ -20,6 +20,7 @@ each phase.
 | `dvb list <job>` | List stored backups with their size and parsed timestamp |
 | `dvb prune <job> [--dry-run]` | Apply the retention policy without a new backup |
 | `dvb check` | Validate the config and round-trip each backend |
+| `dvb crontext "<expr>"` | Parse natural schedule and show next 5 fire times |
 
 Exit codes: `0` success, `1` failure, `2` partial — the archive reached storage
 but a post hook or the retention pass failed, `3` restore extracted OK but the script failed.
@@ -87,7 +88,31 @@ table and the job silently loses its backend.
 retention parses the timestamp back out of the object name.
 
 Jobs are scheduled according to the `TZ` environment variable (default `UTC`), e.g.
-`TZ=America/New_York` or `TZ=Europe/Berlin`.
+`TZ=America/New_York` or `TZ=Europe/Berlin`, or an optional per-job `timezone` setting.
+
+### Schedules: `cron` or `crontext`
+
+Each job must define **exactly one** of `cron` or `crontext`. Setting both or neither is an error.
+
+```crontext
+every minute
+every 15 minutes
+every hour
+every 12 hours
+every day
+every 1 day
+every day at 03:30
+every 12:00
+every monday
+every friday at 18:00
+every mon, wed and fri at 06:30
+every weekday at 09:00
+every weekend at 10:00
+every month
+every month on the 1st at 03:00
+```
+
+See [`docs/crontext.md`](docs/crontext.md) for full syntax and constraints.
 
 ### Storage backends
 

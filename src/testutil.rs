@@ -23,6 +23,9 @@ impl JobBuilder {
             job: JobConfig {
                 name: name.to_owned(),
                 cron: Some("0 3 * * *".to_owned()),
+                crontext: None,
+                timezone: None,
+                schedule_source: Some(crate::config::ScheduleSource::Cron),
                 source: vec![PathBuf::from("/data")],
                 filename: "db-%Y%m%dT%H%M%SZ.tar.zst".to_owned(),
                 compression: Compression::Zstd,

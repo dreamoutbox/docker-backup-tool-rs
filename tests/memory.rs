@@ -69,7 +69,10 @@ fn build_source(dir: &Path, mib: u64) -> std::io::Result<()> {
 fn job(source: PathBuf, root: PathBuf) -> JobConfig {
     JobConfig {
         name: "big".to_owned(),
-        cron: None,
+        cron: Some("0 3 * * *".to_owned()),
+        crontext: None,
+        timezone: None,
+        schedule_source: Some(dvb::config::ScheduleSource::Cron),
         source: vec![source],
         filename: "data-%Y%m%dT%H%M%SZ.tar".to_owned(),
         compression: Compression::None,

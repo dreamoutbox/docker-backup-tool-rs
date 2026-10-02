@@ -167,6 +167,7 @@ async fn strict_host_key_checking_refuses_an_unknown_host() {
             r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/nonexistent"]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
 
@@ -232,6 +233,7 @@ async fn uploads_lists_and_prunes_over_sftp() {
             r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["{}"]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
 compression = "zstd"

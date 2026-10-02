@@ -11,11 +11,36 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone as _, Utc};
-use figment::Figment;
 use figment::providers::{Env, Format, Toml};
+use figment::value::{Dict, Map, Value};
+use figment::{Figment, Metadata, Profile, Provider};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Error, Result};
+
+/// Provider that normalizes `[[job]]` array into indexed dictionary elements so
+/// environment variables such as `DVB__JOB__0__CRONTEXT` merge recursively.
+struct NormalizedToml<P>(P);
+
+impl<P: AsRef<Path>> Provider for NormalizedToml<P> {
+    fn metadata(&self) -> Metadata {
+        Toml::file(self.0.as_ref()).metadata()
+    }
+
+    fn data(&self) -> std::result::Result<Map<Profile, Dict>, figment::Error> {
+        let mut map = Toml::file(self.0.as_ref()).data()?;
+        for dict in map.values_mut() {
+            if let Some(Value::Array(tag, jobs)) = dict.remove("job") {
+                let mut job_map = Dict::new();
+                for (i, job) in jobs.into_iter().enumerate() {
+                    job_map.insert(i.to_string(), job);
+                }
+                dict.insert("job".to_owned(), Value::Dict(tag, job_map));
+            }
+        }
+        Ok(map)
+    }
+}
 
 /// Default location of the configuration file inside the container image.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/dvb/config.toml";
@@ -39,8 +64,55 @@ pub struct Config {
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
 
-    #[serde(rename = "job", default)]
+    #[serde(rename = "job", default, deserialize_with = "deserialize_jobs")]
     pub jobs: Vec<JobConfig>,
+}
+
+fn deserialize_jobs<'de, D>(deserializer: D) -> std::result::Result<Vec<JobConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::collections::BTreeMap;
+
+    struct JobsVisitor;
+
+    impl<'de> Visitor<'de> for JobsVisitor {
+        type Value = Vec<JobConfig>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of jobs or an indexed map of jobs")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut jobs = Vec::new();
+            while let Some(job) = seq.next_element()? {
+                jobs.push(job);
+            }
+            Ok(jobs)
+        }
+
+        fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+        where
+            M: de::MapAccess<'de>,
+        {
+            let mut indexed_jobs: BTreeMap<String, JobConfig> = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry()? {
+                indexed_jobs.insert(key, value);
+            }
+            let mut pairs: Vec<(usize, JobConfig)> = indexed_jobs
+                .into_iter()
+                .filter_map(|(k, v)| k.parse::<usize>().ok().map(|idx| (idx, v)))
+                .collect();
+            pairs.sort_by_key(|(idx, _)| *idx);
+            Ok(pairs.into_iter().map(|(_, job)| job).collect())
+        }
+    }
+
+    deserializer.deserialize_any(JobsVisitor)
 }
 
 /// Docker socket settings. Absent socket disables stop/exec features.
@@ -50,6 +122,17 @@ pub struct DockerConfig {
     /// Path to the Docker unix socket. `None` disables container control.
     #[serde(default)]
     pub socket: Option<PathBuf>,
+}
+
+pub use crontext::{self, CrontextError, Schedule};
+
+/// Origin of a job's schedule (raw cron vs natural-language crontext).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleSource {
+    /// Schedule was supplied directly as a 5-field cron expression.
+    Cron,
+    /// Schedule was supplied as a human-friendly string and resolved to cron.
+    Crontext(String),
 }
 
 /// One backup job.
@@ -62,6 +145,18 @@ pub struct JobConfig {
     /// Standard five field cron expression, evaluated in the `TZ` of the process.
     #[serde(default)]
     pub cron: Option<String>,
+
+    /// Natural language schedule (e.g. `every 15 minutes`, `every friday at 18:00`).
+    #[serde(default)]
+    pub crontext: Option<String>,
+
+    /// Optional timezone override for this job (e.g. `America/New_York`, `UTC`).
+    #[serde(default)]
+    pub timezone: Option<String>,
+
+    /// Origin of the resolved schedule, populated during validation.
+    #[serde(skip)]
+    pub schedule_source: Option<ScheduleSource>,
 
     /// Paths inside the backup container to archive.
     pub source: Vec<PathBuf>,
@@ -428,10 +523,10 @@ impl Config {
     /// [`ConfigError::Invalid`] if it parses but a job does not make sense.
     pub fn load(path: &Path) -> Result<Self> {
         let figment = Figment::new()
-            .merge(Toml::file(path))
-            .merge(Env::prefixed(ENV_PREFIX).split("__"));
+            .merge(NormalizedToml(path))
+            .merge(Env::prefixed(ENV_PREFIX).split("__").lowercase(true));
 
-        let config: Self = figment.extract().map_err(|source| ConfigError::Parse {
+        let mut config: Self = figment.extract().map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
@@ -478,17 +573,17 @@ impl Config {
     /// # Errors
     ///
     /// [`ConfigError::Invalid`] naming the first problem found.
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         if self.jobs.is_empty() {
             return Err(invalid("no [[job]] defined"));
         }
 
         let mut seen = BTreeSet::new();
-        for job in &self.jobs {
+        for job in &mut self.jobs {
             if job.name.trim().is_empty() {
                 return Err(invalid("job name must not be empty"));
             }
-            if !seen.insert(job.name.as_str()) {
+            if !seen.insert(job.name.clone()) {
                 return Err(invalid(format!("duplicate job name `{}`", job.name)));
             }
             job.validate()?;
@@ -504,45 +599,66 @@ impl Config {
 }
 
 impl JobConfig {
-    /// Validate a single job.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError::Invalid`] naming the first problem found, prefixed with
-    /// the job name so a bad job among many is easy to spot.
-    pub fn validate(&self) -> Result<()> {
-        if let Some(cron) = &self.cron {
-            parse_cron(cron).map_err(|err| {
-                invalid(format!("job `{}`: invalid cron `{cron}`: {err}", self.name))
+    /// Return the job's effective timezone, falling back to `default_tz`.
+    #[must_use]
+    pub fn effective_timezone(&self, default_tz: chrono_tz::Tz) -> chrono_tz::Tz {
+        if let Some(tz_str) = &self.timezone {
+            parse_timezone(tz_str).unwrap_or(default_tz)
+        } else {
+            default_tz
+        }
+    }
+
+    fn resolve_and_validate_schedule(&mut self) -> Result<()> {
+        match (&self.cron, &self.crontext) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "job `{}`: cannot specify both `cron` and `crontext`",
+                    self.name
+                )));
+            }
+            (None, None) => {
+                return Err(invalid(format!(
+                    "job `{}`: must specify either `cron` or `crontext`",
+                    self.name
+                )));
+            }
+            (Some(cron), None) => {
+                parse_cron(cron).map_err(|err| {
+                    invalid(format!("job `{}`: invalid cron `{cron}`: {err}", self.name))
+                })?;
+                self.schedule_source = Some(ScheduleSource::Cron);
+            }
+            (None, Some(text)) => {
+                let sched = crontext::parse(text).map_err(|err| {
+                    invalid(format!(
+                        "job `{}`: invalid crontext `{text}`: {err}",
+                        self.name
+                    ))
+                })?;
+                parse_cron(&sched.cron).map_err(|err| {
+                    invalid(format!(
+                        "job `{}`: resolved cron `{}` is invalid: {err}",
+                        self.name, sched.cron
+                    ))
+                })?;
+                self.cron = Some(sched.cron);
+                self.schedule_source = Some(ScheduleSource::Crontext(text.clone()));
+            }
+        }
+
+        if let Some(tz_str) = &self.timezone {
+            parse_timezone(tz_str).map_err(|err| {
+                invalid(format!(
+                    "job `{}`: invalid timezone `{tz_str}`: {err}",
+                    self.name
+                ))
             })?;
         }
+        Ok(())
+    }
 
-        if !self.filename.contains("%Y") {
-            return Err(invalid(format!(
-                "job `{}`: filename template must contain a timestamp (%Y, got `{}`)",
-                self.name, self.filename
-            )));
-        }
-        if !self.filename.contains("%S") {
-            return Err(invalid(format!(
-                "job `{}`: filename template must contain a second-resolution timestamp (%S, got `{}`)",
-                self.name, self.filename
-            )));
-        }
-
-        if self.retention_days < 1 {
-            return Err(invalid(format!(
-                "job `{}`: retention_days must be >= 1",
-                self.name
-            )));
-        }
-        if self.min_keep < 1 {
-            return Err(invalid(format!(
-                "job `{}`: min_keep must be >= 1",
-                self.name
-            )));
-        }
-
+    fn validate_sources(&self) -> Result<()> {
         if self.source.is_empty() {
             return Err(invalid(format!(
                 "job `{}`: source must not be empty",
@@ -571,14 +687,10 @@ impl JobConfig {
                 )));
             }
         }
+        Ok(())
+    }
 
-        if self.stop_timeout_secs == 0 {
-            return Err(invalid(format!(
-                "job `{}`: stop_timeout_secs must be >= 1",
-                self.name
-            )));
-        }
-
+    fn validate_hooks(&self) -> Result<()> {
         for (phase, hooks) in [("pre", &self.pre), ("post", &self.post)] {
             for (index, hook) in hooks.iter().enumerate() {
                 if hook.cmd.is_empty() {
@@ -601,6 +713,54 @@ impl JobConfig {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Validate a single job and resolve its schedule if needed.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first problem found, prefixed with
+    /// the job name so a bad job among many is easy to spot.
+    pub fn validate(&mut self) -> Result<()> {
+        self.resolve_and_validate_schedule()?;
+
+        if !self.filename.contains("%Y") {
+            return Err(invalid(format!(
+                "job `{}`: filename template must contain a timestamp (%Y, got `{}`)",
+                self.name, self.filename
+            )));
+        }
+        if !self.filename.contains("%S") {
+            return Err(invalid(format!(
+                "job `{}`: filename template must contain a second-resolution timestamp (%S, got `{}`)",
+                self.name, self.filename
+            )));
+        }
+
+        if self.retention_days < 1 {
+            return Err(invalid(format!(
+                "job `{}`: retention_days must be >= 1",
+                self.name
+            )));
+        }
+        if self.min_keep < 1 {
+            return Err(invalid(format!(
+                "job `{}`: min_keep must be >= 1",
+                self.name
+            )));
+        }
+
+        self.validate_sources()?;
+
+        if self.stop_timeout_secs == 0 {
+            return Err(invalid(format!(
+                "job `{}`: stop_timeout_secs must be >= 1",
+                self.name
+            )));
+        }
+
+        self.validate_hooks()?;
 
         Ok(())
     }
@@ -752,6 +912,24 @@ pub fn parse_cron(
         .parse(expression)
 }
 
+/// Parse an IANA timezone string like `America/New_York` or `UTC`.
+///
+/// Leading `:` (POSIX style) and whitespace are stripped.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if `tz_str` cannot be parsed as an IANA timezone name.
+pub fn parse_timezone(tz_str: &str) -> Result<chrono_tz::Tz> {
+    let clean = tz_str.trim().strip_prefix(':').unwrap_or(tz_str.trim());
+    if clean.is_empty() {
+        Ok(chrono_tz::UTC)
+    } else {
+        clean
+            .parse::<chrono_tz::Tz>()
+            .map_err(|err| invalid(format!("invalid timezone `{tz_str}`: {err}")))
+    }
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::Config(ConfigError::Invalid(message.into()))
 }
@@ -763,6 +941,7 @@ mod tests {
 
     fn job_yaml() -> String {
         r#"
+cron = "0 3 * * *"
 source = ["/backup/pgdata"]
 filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
 retention_days = 14
@@ -785,9 +964,9 @@ min_keep = 3
     fn parse(body: &str, dir: &Path) -> Result<Config> {
         let path = write_config(dir, body);
         let figment = Figment::new()
-            .merge(Toml::file(&path))
-            .merge(Env::prefixed(ENV_PREFIX).split("__"));
-        let config: Config = figment.extract().map_err(|source| ConfigError::Parse {
+            .merge(NormalizedToml(&path))
+            .merge(Env::prefixed(ENV_PREFIX).split("__").lowercase(true));
+        let mut config: Config = figment.extract().map_err(|source| ConfigError::Parse {
             path: path.clone(),
             source,
         })?;
@@ -829,6 +1008,7 @@ min_keep = 3
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/a/data", "/b/data"]
 filename = "data-%Y%m%dT%H%M%SZ"
 retention_days = 1
@@ -850,6 +1030,7 @@ min_keep = 1
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%m%d.tar"
 retention_days = 1
@@ -868,6 +1049,7 @@ min_keep = 1
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M.tar"
 retention_days = 1
@@ -886,6 +1068,7 @@ min_keep = 1
         let zero_retention = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
 retention_days = 0
@@ -913,6 +1096,7 @@ min_keep = 1
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = []
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -978,6 +1162,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -1020,6 +1205,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -1049,7 +1235,10 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn object_name_is_rendered_in_utc() {
         let job = JobConfig {
             name: "db".to_owned(),
-            cron: None,
+            cron: Some("0 3 * * *".to_owned()),
+            crontext: None,
+            timezone: None,
+            schedule_source: Some(ScheduleSource::Cron),
             source: vec![PathBuf::from("/backup/pgdata")],
             filename: "pgdata-%Y%m%dT%H%M%SZ.tar".to_owned(),
             compression: Compression::Zstd,
@@ -1106,6 +1295,7 @@ socket = "/var/run/docker.sock"
 
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
 stop_containers = ["postgres"]
@@ -1123,6 +1313,7 @@ stop_containers = ["postgres"]
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
 stop_containers = ["postgres"]
@@ -1152,6 +1343,7 @@ socket = "/var/run/docker.sock"
 
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -1183,6 +1375,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -1209,6 +1402,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -1236,6 +1430,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let body = r#"
 [[job]]
 name = "db"
+cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
   [job.storage]
@@ -1249,5 +1444,159 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let err = parse(body, dir.path()).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
         assert!(err.to_string().contains("`unknown`"), "{err}");
+    }
+
+    #[test]
+    fn rejects_both_cron_and_crontext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+cron = "0 3 * * *"
+crontext = "every day at 03:00"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let err = parse(body, dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot specify both `cron` and `crontext`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_neither_cron_nor_crontext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let err = parse(body, dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must specify either `cron` or `crontext`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_crontext_and_resolves_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+crontext = "every friday at 18:00"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let config = parse(body, dir.path()).expect("valid config");
+        let job = config.job("db").expect("job");
+        assert_eq!(job.cron.as_deref(), Some("0 18 * * 5"));
+        assert_eq!(
+            job.schedule_source,
+            Some(ScheduleSource::Crontext("every friday at 18:00".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_crontext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+crontext = "every 5 hours"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let err = parse(body, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("does not divide 24"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_timezone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+cron = "0 3 * * *"
+timezone = "Mars/Olympus_Mons"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let err = parse(body, dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid timezone `Mars/Olympus_Mons`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_job_timezone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[[job]]
+name = "db"
+cron = "0 3 * * *"
+timezone = "America/New_York"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#;
+        let config = parse(body, dir.path()).expect("valid config");
+        let job = config.job("db").expect("job");
+        assert_eq!(
+            job.effective_timezone(chrono_tz::UTC),
+            chrono_tz::America::New_York
+        );
+    }
+
+    #[test]
+    fn env_override_crontext_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[[job]]
+name = "db"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.storage]
+  type = "fs"
+  root = "/tmp/x"
+"#,
+        );
+
+        let figment = Figment::new()
+            .merge(NormalizedToml(&path))
+            .merge(("job.0.crontext", "every 15 minutes"));
+        let mut config: Config = figment.extract().expect("extract");
+        config.validate().expect("validate");
+        let job = config.job("db").expect("job");
+        assert_eq!(job.cron.as_deref(), Some("*/15 * * * *"));
+        assert_eq!(
+            job.schedule_source,
+            Some(ScheduleSource::Crontext("every 15 minutes".to_owned()))
+        );
     }
 }
