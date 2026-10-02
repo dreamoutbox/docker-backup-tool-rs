@@ -7,23 +7,46 @@
 //! * `1` — failure
 //! * `2` — partial: the archive was uploaded but prune or a post hook failed
 
+mod archive;
 mod cli;
+mod config;
 mod error;
+mod job;
+mod lock;
+mod storage;
 
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use anyhow::Context as _;
+use chrono::Utc;
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, GlobalArgs, LogFormat};
+use crate::config::Config;
 use crate::error::{EXIT_FAILURE, Error};
+
+/// Exit code for a completed command.
+const EXIT_SUCCESS: u8 = 0;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(&cli.global);
 
-    match dispatch(&cli) {
+    // The runtime is built by hand so `spawn_blocking` (used by the archiver)
+    // gets a full multi-threaded blocking pool.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!("cannot start the tokio runtime: {err}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+
+    match runtime.block_on(dispatch(&cli)) {
         Ok(exit) => ExitCode::from(exit),
         Err(err) => {
             // `{:#}` renders the whole anyhow context chain on one line.
@@ -34,10 +57,10 @@ fn main() -> ExitCode {
 }
 
 /// Run the requested subcommand. Each arm returns the process exit code.
-fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
+async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     let outcome: error::Result<u8> = match &cli.command {
         Command::Run => Err(Error::NotImplemented("run")),
-        Command::Backup { .. } => Err(Error::NotImplemented("backup")),
+        Command::Backup { job } => backup(&cli.global, job).await,
         Command::Prune { .. } => Err(Error::NotImplemented("prune")),
         Command::List { .. } => Err(Error::NotImplemented("list")),
         Command::Check => Err(Error::NotImplemented("check")),
@@ -46,6 +69,17 @@ fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     outcome
         .map_err(anyhow::Error::from)
         .with_context(|| describe(&cli.command))
+}
+
+/// `dvb backup <job>`: one archive, streamed to storage, right now.
+async fn backup(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
+    let config = Config::load(&global.config)?;
+    let job = config.job(job_name)?;
+
+    let op = crate::storage::operator(&job.storage)?;
+    crate::job::run_backup(&op, job, Utc::now()).await?;
+
+    Ok(EXIT_SUCCESS)
 }
 
 /// Short description of what was attempted, used as error context.
@@ -61,12 +95,12 @@ fn describe(command: &Command) -> String {
 
 /// Install the global tracing subscriber (text or JSON).
 ///
-/// The filter comes from `DVB_LOG` when set (e.g. `dvb=debug,s3=trace`),
+/// The filter comes from `DVB_LOG` when set (e.g. `dvb=debug,opendal=trace`),
 /// otherwise from the `-v` verbosity count. ANSI escapes are only emitted when
 /// stderr is a terminal, so `docker logs` stays readable.
 fn init_tracing(global: &GlobalArgs) {
     let filter = tracing_subscriber::EnvFilter::builder()
-        .with_env_var("DVB_LOG")
+        .with_env_var(config::ENV_LOG_FILTER)
         .with_default_directive(default_filter_directive(global.verbose).into())
         .from_env_lossy();
 
@@ -109,13 +143,18 @@ mod tests {
 
     #[test]
     fn exit_codes_match_the_specification() {
+        assert_eq!(EXIT_SUCCESS, 0);
         assert_eq!(error::EXIT_FAILURE, 1);
     }
 
     #[test]
-    fn unstubbed_commands_fail_with_exit_code_one() {
+    fn not_yet_implemented_commands_fail() {
         let cli = Cli::parse_from(["dvb", "check"]);
-        let err = dispatch(&cli).unwrap_err();
+        let err = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(dispatch(&cli))
+            .unwrap_err();
         assert!(format!("{err:#}").contains("not implemented yet"));
     }
 

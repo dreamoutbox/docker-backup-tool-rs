@@ -8,12 +8,47 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
-# Phase 0 dependencies. Later phases add storage/cron/docker/archive crates.
+# Every direct dependency is pinned with `=` so a rebuild cannot silently pick
+# up a new minor version. `cargo update -p <crate> --precise <version>` is how
+# bumps happen.
+
+# CLI and process plumbing
 clap = { version = "=4.6.7", features = ["derive", "env"] }
-thiserror = "=2.0.21"
 anyhow = "=1.0.104"
+thiserror = "=2.0.21"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
+tokio = { version = "=1.53.1", features = ["full"] }
+tokio-util = { version = "=0.7.19", features = ["io", "io-util"] }
+
+# Configuration
+serde = { version = "=1.0.229", features = ["derive"] }
+figment = { version = "=0.10.19", features = ["toml", "env"] }
+chrono = { version = "=0.4.45", features = ["clock", "serde"] }
+croner = "=4.0.0"
+
+# Storage. `default-features = false` plus explicit features keeps the TLS
+# stack on rustls; native-tls/openssl must never appear in `cargo tree`.
+opendal = { version = "=0.59.3", default-features = false, features = [
+  "executors-tokio",
+  "http-transport-reqwest-rustls",
+  "layers-logging",
+  "layers-retry",
+  "layers-timeout",
+  "services-dropbox",
+  "services-fs",
+  "services-memory",
+  "services-s3",
+  "services-sftp",
+] }
+
+# Archiving
+tar = "=0.4.46"
+zstd = "=0.14.0"
+flate2 = "=1.1.10"
+
+# Cross-process job locking
+fd-lock = "=4.0.4"
 
 [profile.release]
 lto = "thin"
@@ -28,7 +63,19 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# `Error` carries sources and paths for diagnostics; boxing every variant would
+# cost an allocation per error for no benefit, since errors are rare.
+result_large_err = "allow"
 
 [dev-dependencies]
 assert_cmd = "=2.2.2"
 predicates = "=3.1.4"
+serde_json = "=1.0.149"
+tempfile = "=3.27.0"
+
+# Reused by tests/e2e_fs.rs, which reads real archives and holds a job lock the
+# way a second process would.
+fd-lock = "=4.0.4"
+tar = "=0.4.46"
+zstd = "=0.14.0"
+flate2 = "=1.1.10"

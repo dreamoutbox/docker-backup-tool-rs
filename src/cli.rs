@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
+use crate::config::DEFAULT_CONFIG_PATH;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "dvb",
@@ -30,7 +32,7 @@ pub struct GlobalArgs {
         long,
         global = true,
         env = "DVB_CONFIG",
-        default_value = "/etc/dvb/config.toml",
+        default_value = DEFAULT_CONFIG_PATH,
         value_name = "PATH"
     )]
     pub config: PathBuf,

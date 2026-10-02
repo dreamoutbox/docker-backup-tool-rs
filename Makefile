@@ -35,11 +35,13 @@ docker-build: ## Build the container image
 docker-build-cache: ## Plain-cache build (deps cached in layers by cargo-chef)
 	$(DOCKER) build --no-cache-filter -t $(IMAGE) .
 
-openssl-check: ## Fail if any openssl dependency sneaks in (rustls everywhere)
-	@if $(CARGO) tree | grep -i openssl; then \
-		echo "ERROR: openssl found in the dependency tree"; exit 1; \
+openssl-check: ## Fail if a real TLS backend sneaks in (rustls everywhere)
+	@# `openssl-probe` is a Windows-only helper inside rustls-native-certs and
+	@# links nothing on Linux, so match the libraries rather than the name.
+	@if $(CARGO) tree | grep -iE "openssl-sys|native-tls"; then \
+		echo "ERROR: openssl/native-tls found in the dependency tree"; exit 1; \
 	else \
-		echo "OK: no openssl in the dependency tree"; \
+		echo "OK: rustls only, no openssl/native-tls"; \
 	fi
 
 clean: ## Remove build artifacts

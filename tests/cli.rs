@@ -38,10 +38,9 @@ fn global_flags_accept_the_documented_env_vars() {
 }
 
 #[test]
-fn unstubbed_subcommands_exit_with_failure() {
+fn not_yet_implemented_subcommands_exit_with_failure() {
     for args in [
         vec!["run"],
-        vec!["backup", "db"],
         vec!["prune", "db"],
         vec!["list", "db"],
         vec!["check"],
@@ -53,6 +52,16 @@ fn unstubbed_subcommands_exit_with_failure() {
             .code(1)
             .stderr(predicates::str::contains("not implemented yet"));
     }
+}
+
+#[test]
+fn backup_without_a_config_file_fails() {
+    dvb()
+        .args(["backup", "db"])
+        .env("DVB_CONFIG", "/nonexistent/dvb.toml")
+        .assert()
+        .failure()
+        .code(1);
 }
 
 #[test]
