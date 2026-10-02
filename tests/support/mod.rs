@@ -11,12 +11,12 @@ use testcontainers::{ContainerAsync, ContainerRequest, Image, ImageExt};
 ///
 /// Defaults to 0.5. These tests spin up a real server, and leaving them
 /// unconstrained starves the rest of the machine.
-pub const DEFAULT_CPU: f64 = 0.5;
+pub const DVB_TEST_DEFAULT_CPU: f64 = 1.0;
 
 /// Memory limit in MiB, overridable with `DVB_TEST_MEM_MB`.
 ///
 /// Defaults to 512 MiB, which `SeaweedFS` still runs comfortably in.
-pub const DEFAULT_MEM_MB: i64 = 512;
+pub const DVB_TEST_DEFAULT_MEM_MB: i64 = 512;
 
 /// CPU limit to apply, from `DVB_TEST_CPU` or [`DEFAULT_CPU`].
 pub fn cpu_limit() -> f64 {
@@ -24,7 +24,7 @@ pub fn cpu_limit() -> f64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|cores| *cores > 0.0)
-        .unwrap_or(DEFAULT_CPU)
+        .unwrap_or(DVB_TEST_DEFAULT_CPU)
 }
 
 /// Convert a CPU count to Docker's `nano_cpus` unit (1e-9 CPU).
@@ -44,7 +44,7 @@ pub fn memory_limit_bytes() -> i64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|mb| *mb > 0)
-        .unwrap_or(DEFAULT_MEM_MB);
+        .unwrap_or(DVB_TEST_DEFAULT_MEM_MB);
     mb * 1024 * 1024
 }
 
