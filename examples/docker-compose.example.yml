@@ -18,6 +18,12 @@
 #
 # Checking configuration and connectivity:
 #   docker exec backup dvb check
+#
+# Restoring a backup (to default job.restore.dir without script):
+#   docker exec backup dvb restore db
+#
+# Restoring a backup and executing restore hook script:
+#   docker exec backup dvb restore db --script /scripts/pg_restore.sh
 
 services:
   # Database service to back up
@@ -75,6 +81,8 @@ services:
       #   CONTAINERS=1
       #   POST=1
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Restore script hook (optional)
+      - ./pg_restore.sh:/scripts/pg_restore.sh:ro
     environment:
       - TZ=UTC
       - DVB_LOG=dvb=info

@@ -16,7 +16,8 @@ dvb restore <job>
     [--name <object>]            # exact backup object name
     [--at <RFC3339|YYYY-MM-DD>]  # newest backup at or before this time
                                  # default (neither flag): newest backup
-    [--to <dir>]                 # extraction dir; default: $DVB_TMP_DIR/restore-<job>-<timestamp>
+    [--to <dir>]                 # extraction dir; default: job.restore.dir from config when no script;
+                                 # or $DVB_TMP_DIR/restore-<job>-<timestamp> when a script is specified
     [--script <path>]            # run: <script> <abs-extracted-dir> [extra args]
     [--script-timeout <secs>]    # default 3600
     [--force]                    # allow extracting into an existing non-empty dir
@@ -31,15 +32,19 @@ dvb crontext "<expression>"      # print resolved cron + next 5 fire times (Phas
 
 Exit codes (extends plan 1): `0` ok, `1` failure, `2` partial (backup ok, prune/post failed), **`3` restore extracted OK but the script failed** (extracted dir is kept for inspection).
 
-New modules: `restore.rs`, `crontext.rs`, `integrity.rs` (Phase 9).
+New modules: `restore.rs`, `integrity.rs` (Phase 9); new workspace member crate: `crates/crontext`.
 
 Docker usage example:
 
 ```
-docker exec backup dvb restore db --at 2026-10-01 --script /scripts/pgrestore.sh
+# Restore and run custom restore script:
+docker exec backup dvb restore db --at 2026-10-01 --script /scripts/pg_restore.sh
+
+# Restore without script (extracts directly to job.restore.dir, e.g. /restore):
+docker exec backup dvb restore db --at 2026-10-01
 ```
 
-Note: the script runs **inside the dvb container**, so it needs its tooling there (for example `psql`) or must call `docker exec` itself. Document this.
+Note: when `--script` is used, the script runs **inside the dvb container**, so it needs its tooling there (for example `psql`) or must call `docker exec` itself (see `examples/pg_restore.sh`). Document this.
 
 ## Config additions
 
@@ -50,8 +55,8 @@ crontext = "every friday at 18:00"      # XOR with `cron` (Phase 8)
 timezone = "Europe/Berlin"              # optional; overrides TZ for this job
 
   [job.restore]                         # optional defaults, CLI flags override
-  dir = "/restore"                      # base dir for default --to
-  script = "/scripts/pgrestore.sh"
+  dir = "/restore"                      # default extraction target dir when no script is specified
+  script = "/scripts/pg_restore.sh"     # optional default restore script
   script_timeout_secs = 3600
 ```
 
@@ -72,10 +77,14 @@ Tasks:
 2. **Compression detection:** by magic bytes, not extension (zstd `28 B5 2F FD`, gzip `1F 8B`; otherwise treat as plain tar). If the magic contradicts the job's configured compression, log a warning and trust the magic.
 3. **Streaming download and extract:** OpenDAL reader, bridged to a blocking reader (`SyncIoBridge` in `spawn_blocking`), then decompress, then `tar::Archive`. No full-archive buffering and no temp file. Memory must stay bounded for multi-GiB archives.
 4. **Target dir handling:**
-   - `--to` absent: default `<job.restore.dir or $DVB_TMP_DIR>/restore-<job>-<archive-timestamp>`;
-   - target does not exist or is empty and no `--force`: extract into a sibling staging dir `<to>.dvb-partial`, then `rename` into place on success; on any failure remove the staging dir;
-   - target non-empty without `--force`: fail before downloading anything;
-   - `--force`: extract in place, overwriting files, never deleting anything pre-existing; on failure leave it as is and say so.
+   - **Target dir resolution:**
+     - If `--to <dir>` is explicitly passed: extract directly to `<dir>`.
+     - If `--to` is omitted and **no script is specified** (neither `--script` CLI flag nor `job.restore.script` config): default to `job.restore.dir` from `config.toml`. If `job.restore.dir` is not configured, fail early before downloading with a clear validation error requiring `--to <dir>` or `job.restore.dir`.
+     - If `--to` is omitted and a **script is specified** (`--script` or `job.restore.script`): default to `<job.restore.dir or $DVB_TMP_DIR>/restore-<job>-<archive-timestamp>`.
+   - **Target directory rules and staging:**
+     - target does not exist or is empty and no `--force`: extract into a sibling staging dir `<to>.dvb-partial`, then `rename` into place on success; on any failure remove the staging dir;
+     - target non-empty without `--force`: fail before downloading anything;
+     - `--force`: extract in place, overwriting files, never deleting anything pre-existing; on failure leave it as is and say so.
    - Create parent dirs as needed. Print the final absolute path on stdout (and only that on stdout, logs go to stderr) so `$(dvb restore ...)` is scriptable.
 5. **Extraction safety** (security critical):
    - use per-entry `entry.unpack_in(dest)` and treat a `false` return (unsafe path) as a **hard error**, not a skip;
@@ -109,20 +118,19 @@ Tasks:
 2. **Invocation:** `tokio::process::Command::new(script).arg(<absolute extracted dir>).args(extra_args)`. **No shell.** Inherit cwd. Extra args come from after `--`. `kill_on_drop(true)` and a timeout (`--script-timeout`, default 3600s; on timeout kill the process, report it distinctly).
 3. **Environment passed to the script:** `DVB_JOB`, `DVB_RESTORE_DIR` (same absolute path as arg 1), `DVB_ARCHIVE` (object name), `DVB_ARCHIVE_TIME` (RFC3339 of the backup).
 4. **Output:** stream stdout and stderr to `tracing` line by line (stderr in dvb's own stdout contract is separate: dvb's single stdout line remains the extracted dir path).
-5. **Failure semantics:** script exits non-zero or times out: keep the extracted dir, log its path, exit code `3`. `--cleanup` removes the extracted dir **only when the script succeeded** (and only dirs dvb created, never a pre-existing `--force` target).
+5. **Failure semantics:** script exits non-zero or times out: keep the extracted dir, log its path, exit code `3`. `--cleanup` removes the extracted dir **only when a script was run and succeeded** (and only for temporary staging directories dvb created, never when extracting directly without a script or into a pre-existing `--force` target).
 6. **`--stop-containers`:** reuse `StopGuard` with the job's `stop_containers`/`stop_label`. Order: acquire lock, download+extract, stop containers, run script, **always** `restore()` containers (also on script failure, timeout, and SIGINT/SIGTERM via the existing `CancellationToken`). Fail validation if the flag is given without a Docker socket or without `stop_containers` configured.
 7. **Signals:** SIGTERM during extract removes the staging dir; during the script kills it, restarts containers if stopped, then exits non-zero.
-8. Add `docs/restore.md` with an example script:
+8. Add `docs/restore.md` and document `examples/pg_restore.sh`:
+   Provide `examples/pg_restore.sh` as the reference PostgreSQL restore script. It handles both logical dumps (`dump.sql` via `psql`) and custom dumps via `pg_restore`, supporting local tools as well as containerized databases via Docker socket execution.
+   Matching commands:
+   ```sh
+   # Restore with custom script
+   dvb restore db --script ./examples/pg_restore.sh
 
-```sh
-#!/bin/sh
-# pgrestore.sh <extracted-dir>
-set -eu
-DIR="$1"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$DIR/dump.sql"
-```
-
-and the matching command: `dvb restore db --script ./pgrestore.sh`.
+   # Restore directly into job.restore.dir without script
+   dvb restore db
+   ```
 
 Acceptance criteria:
 
@@ -136,20 +144,31 @@ Acceptance criteria:
 
 ---
 
-## Phase 8: `crontext` human-friendly schedules
+## Phase 8: `crontext` human-friendly schedules (separate workspace crate)
 
-Goal: a readable alternative to cron syntax, resolved at config load into a standard 5-field cron string. The scheduler (plan 1 Phase 4) keeps consuming only cron.
+Goal: extract human-friendly schedule parsing into a standalone workspace member crate `crates/crontext`, and integrate it into `dvb`. Resolved at config load into a standard 5-field cron string. The scheduler (plan 1 Phase 4) keeps consuming only cron.
+
+Workspace layout:
+- Root `Cargo.toml` converts to a Cargo workspace:
+  ```toml
+  [workspace]
+  members = [".", "crates/crontext"]
+  ```
+- `dvb` depends on `crontext = { path = "crates/crontext" }`.
+- `crates/crontext` is a leaf library crate with no dependency on `dvb` (preventing circular dependencies). Edition 2024, pinned deps (`thiserror`).
 
 Config rules:
 
 - Each job must set **exactly one** of `cron` or `crontext`. Both or neither is a validation error. Use `deny_unknown_fields`.
 - Optional per-job `timezone` (IANA name via `chrono-tz`) overrides `TZ`/UTC.
-- Resolution happens once in `config.rs`; store the resolved cron plus the original text for logging.
+- Resolution happens once in `dvb`'s `config.rs` using `crontext::parse`; store the resolved cron plus the original text for logging.
 
-Implementation (`crontext.rs`): a small hand-written parser (no regex crate). Pure function:
+Implementation (`crates/crontext`): a small hand-written parser (no regex crate). Pure function:
 
 ```rust
 pub fn parse(input: &str) -> Result<Schedule, CrontextError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule { pub cron: String, pub description: String }
 ```
 
@@ -189,10 +208,12 @@ CLI:
 
 Acceptance criteria:
 
+- `cargo check -p crontext` and `cargo test -p crontext` pass in isolation.
+- `cargo check --workspace` and `cargo test --workspace` pass cleanly.
 - Table-driven unit tests covering **every row above** plus case/whitespace variations (`  Every   FRIDAY at 18:00 `), `am/pm` edge cases, plural/singular forms.
 - Negative tests with asserted error messages: `every 5 hours`, `every 7 minutes`, `every 2 days`, `every month on the 31st`, `every someday`, `every 25:00`, `every friday at 18:60`, empty string, missing `every`.
 - Property test: for any successfully parsed expression, the output is accepted by `croner` and has exactly 5 fields.
-- Config tests: both `cron` and `crontext` set fails; neither set fails; `timezone` invalid fails; env override (`DVB__JOB__0__CRONTEXT`) works.
+- Config tests in `dvb`: both `cron` and `crontext` set fails; neither set fails; `timezone` invalid fails; env override (`DVB__JOB__0__CRONTEXT`) works.
 - A doc/README test asserts every example in `README.md` and `docs/` parses (extract from a fenced block tagged `crontext`).
 - Scheduler test (reuse plan 1 fake clock) with `every 12 hours` fires at 00:00 and 12:00 in the job's timezone, including across a DST change for a non-UTC zone.
 
@@ -227,4 +248,5 @@ Acceptance criteria:
 - All external calls (storage reads, Docker, script) have timeouts or cancellation.
 - Redact secrets everywhere; the script environment must **not** include storage credentials.
 - Tests needing Docker/MinIO/SFTP stay behind the same feature flag or `#[ignore]` convention as plan 1.
+- Cargo workspace: root `Cargo.toml` manages `members = [".", "crates/crontext"]`. Dockerfile build copies workspace members (`COPY . .`) and `cargo chef cook` / `cargo build` run with workspace support.
 - Keep the Docker image build unchanged: no new system packages are needed (the cargo-chef multi-stage Dockerfile from plan 1 stays as is). Only add Rust deps: `sha2`, `hex`, and optionally `fs4` or `rustix` for the free-space check.

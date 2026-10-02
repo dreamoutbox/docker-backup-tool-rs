@@ -22,3 +22,8 @@ prefix = "db"
 access_key_id = "dvbtest"
 secret_access_key = "dvbtest-secret"
 force_path_style = true
+
+# [job.restore]
+# dir = "/restore"                            # Default extraction target directory when no --script is passed
+# script = "/scripts/pg_restore.sh"           # Optional default restore script
+# script_timeout_secs = 3600
