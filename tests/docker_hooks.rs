@@ -122,6 +122,29 @@ min_keep = 3
         (child, log)
     }
 
+    fn restore(&self, args: &[&str]) -> std::process::Output {
+        self.dvb()
+            .args(["restore", JOB])
+            .args(args)
+            .output()
+            .expect("run dvb restore")
+    }
+
+    fn restore_to_log(&self, args: &[&str]) -> (std::process::Child, PathBuf) {
+        let log = self.path().join("restore.log");
+        let file = std::fs::File::create(&log).expect("create log");
+        let child = self
+            .dvb()
+            .env("DVB_LOG", "info")
+            .args(["restore", JOB])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(file))
+            .spawn()
+            .expect("spawn dvb restore");
+        (child, log)
+    }
+
     /// Standard error of a finished run, for assertion messages.
     fn stderr_of(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
@@ -474,4 +497,134 @@ fn terminate(pid: u32) -> std::io::Result<std::process::Output> {
     std::process::Command::new("/usr/bin/kill")
         .args(["-TERM", &pid.to_string()])
         .output()
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn restore_stops_containers_before_script_and_restarts_them_after() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let container = sleeper().await;
+    let id = container.id().to_owned();
+    let before = started_at(&id).await;
+
+    let fixture = Fixture::new(&format!("stop_containers = [\"{id}\"]"));
+    fixture.write_payload("data.txt", 1);
+    assert!(fixture.backup().status.success());
+
+    // Script that verifies the container is stopped while it runs
+    let script_path = fixture.path().join("check_stopped.sh");
+    let script_content = format!(
+        r#"#!/bin/sh
+docker inspect -f '{{{{.State.Running}}}}' "{id}" > "$1/container_running_status.txt" 2>&1 || true
+"#
+    );
+    std::fs::write(&script_path, script_content).expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let target = fixture.path().join("restore_target");
+    let target_str = target.display().to_string();
+
+    let res = fixture.restore(&[
+        "--to",
+        &target_str,
+        "--stop-containers",
+        "--script",
+        &script_path.display().to_string(),
+    ]);
+
+    assert!(
+        res.status.success(),
+        "restore failed: stderr={}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+
+    // Verify container was stopped during the script
+    let status_file = target.join("container_running_status.txt");
+    assert!(status_file.exists());
+    let status_content = std::fs::read_to_string(&status_file).unwrap();
+    assert!(
+        status_content.trim() == "false" || status_content.contains("false"),
+        "expected container to be stopped during script, got: {status_content}"
+    );
+
+    // Verify container is running now and was restarted
+    assert!(is_running(&id).await);
+    assert_ne!(started_at(&id).await, before);
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn restore_restarts_containers_on_script_failure() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let container = sleeper().await;
+    let id = container.id().to_owned();
+    let before = started_at(&id).await;
+
+    let fixture = Fixture::new(&format!("stop_containers = [\"{id}\"]"));
+    fixture.write_payload("data.txt", 1);
+    assert!(fixture.backup().status.success());
+
+    let script_path = fixture.path().join("failing_script.sh");
+    std::fs::write(&script_path, b"#!/bin/sh\nexit 1\n").expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let target = fixture.path().join("restore_fail_target");
+    let target_str = target.display().to_string();
+
+    let res = fixture.restore(&[
+        "--to",
+        &target_str,
+        "--stop-containers",
+        "--script",
+        &script_path.display().to_string(),
+    ]);
+
+    assert_eq!(res.status.code(), Some(3));
+    assert!(is_running(&id).await);
+    assert_ne!(started_at(&id).await, before);
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn restore_sigterm_during_script_restarts_containers() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let container = sleeper().await;
+    let id = container.id().to_owned();
+    let before = started_at(&id).await;
+
+    let fixture = Fixture::new(&format!("stop_containers = [\"{id}\"]"));
+    fixture.write_payload("data.txt", 1);
+    assert!(fixture.backup().status.success());
+
+    let script_path = fixture.path().join("slow_script.sh");
+    std::fs::write(&script_path, b"#!/bin/sh\nsleep 30\n").expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let target = fixture.path().join("restore_sigterm_target");
+    let target_str = target.display().to_string();
+
+    let (mut child, log) = fixture.restore_to_log(&[
+        "--to",
+        &target_str,
+        "--stop-containers",
+        "--script",
+        &script_path.display().to_string(),
+    ]);
+
+    // Wait until the container has been stopped
+    wait_until_stopped(&id, &mut child, &log).await;
+
+    // Send SIGTERM to dvb restore
+    let signalled = terminate(child.id()).expect("send SIGTERM");
+    assert!(signalled.status.success());
+
+    let status = child.wait().expect("wait for child");
+    assert!(!status.success());
+
+    // Verify container was restarted
+    assert!(is_running(&id).await);
+    assert_ne!(started_at(&id).await, before);
 }

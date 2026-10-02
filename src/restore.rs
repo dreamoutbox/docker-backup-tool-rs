@@ -6,15 +6,27 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
 
 use crate::config::{Compression, JobConfig};
-use crate::error::{Error, Result};
+use crate::docker;
+use crate::error::{EXIT_SCRIPT_FAILURE, EXIT_SUCCESS, Error, Result};
 use crate::lock::JobLock;
 use crate::retention::{self, Backup};
+use crate::signal::Shutdown;
+
+/// The outcome of a restore operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// The absolute path where files were extracted.
+    pub target_dir: PathBuf,
+    /// The process exit code (0 for success, 3 for script failure/timeout).
+    pub exit_code: u8,
+}
 
 /// CLI options driving a restore operation.
 #[derive(Debug, Clone)]
@@ -469,20 +481,265 @@ fn prepare_extract_dirs(target_dir: &Path, force: bool) -> Result<(PathBuf, Opti
     }
 }
 
-/// Execute the core restore operation: lock, select, download, decompress, and extract.
+/// Resolve and validate a restore script path (from CLI or config).
+///
+/// Ensures the script exists, is a regular file, and has executable permissions on Unix.
+fn resolve_and_validate_script(
+    job: &JobConfig,
+    cli_script: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let raw = cli_script.or_else(|| job.restore.as_ref().and_then(|r| r.script.as_deref()));
+
+    let Some(raw_path) = raw else {
+        return Ok(None);
+    };
+
+    let path = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir().map_err(|source| Error::Io {
+            path: PathBuf::from("."),
+            source,
+        })?;
+        cwd.join(raw_path)
+    };
+
+    if !path.exists() {
+        return Err(Error::Restore(format!(
+            "restore script `{}` does not exist",
+            path.display()
+        )));
+    }
+
+    if !path.is_file() {
+        return Err(Error::Restore(format!(
+            "restore script `{}` is not a regular file",
+            path.display()
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let meta = path.metadata().map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(Error::Restore(format!(
+                "restore script `{}` is not executable (chmod +x required)",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(Some(path))
+}
+
+/// Validate `--stop-containers` requirements before downloading anything.
+fn validate_stop_containers(
+    job: &JobConfig,
+    stop_containers_flag: bool,
+    docker_socket: Option<&Path>,
+) -> Result<()> {
+    if !stop_containers_flag {
+        return Ok(());
+    }
+
+    if !job.wants_stop() {
+        return Err(Error::Restore(format!(
+            "--stop-containers requested, but job `{}` has no stop_containers or stop_label configured",
+            job.name
+        )));
+    }
+
+    if docker_socket.is_none() {
+        return Err(Error::Restore(
+            "--stop-containers requested, but [docker].socket is not configured".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+enum ScriptRunError {
+    Cancelled,
+    TimedOut,
+    Failed(i32),
+    Io(std::io::Error),
+}
+
+async fn run_script_process(
+    script_path: &Path,
+    extracted_dir: &Path,
+    backup: &Backup,
+    job: &JobConfig,
+    extra_args: &[String],
+    timeout_secs: u64,
+    shutdown: &Shutdown,
+) -> std::result::Result<(), ScriptRunError> {
+    let mut child = tokio::process::Command::new(script_path)
+        .arg(extracted_dir)
+        .args(extra_args)
+        .envs([
+            ("DVB_JOB", job.name.as_str()),
+            ("DVB_RESTORE_DIR", extracted_dir.to_str().unwrap_or("")),
+            ("DVB_ARCHIVE", backup.path.as_str()),
+            ("DVB_ARCHIVE_TIME", backup.timestamp.to_rfc3339().as_str()),
+        ])
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(ScriptRunError::Io)?;
+
+    let stdout = tokio::spawn(crate::hooks::pump(child.stdout.take(), "stdout"));
+    let stderr = tokio::spawn(crate::hooks::pump(child.stderr.take(), "stderr"));
+
+    let outcome = tokio::select! {
+        wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => {
+            match wait_res {
+                Ok(Ok(status)) => {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err(ScriptRunError::Failed(status.code().unwrap_or(-1)))
+                    }
+                }
+                Ok(Err(err)) => Err(ScriptRunError::Io(err)),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    Err(ScriptRunError::TimedOut)
+                }
+            }
+        }
+        () = shutdown.cancelled() => {
+            let _ = child.kill().await;
+            Err(ScriptRunError::Cancelled)
+        }
+    };
+
+    crate::hooks::drain(stdout).await;
+    crate::hooks::drain(stderr).await;
+
+    outcome
+}
+
+async fn execute_restore_hook(
+    script_path: &Path,
+    target_path: &Path,
+    backup: &Backup,
+    job: &JobConfig,
+    options: &RestoreOptions,
+    shutdown: &Shutdown,
+    docker_socket: Option<&Path>,
+) -> Result<u8> {
+    let timeout_secs = options
+        .script_timeout
+        .or_else(|| job.restore.as_ref().map(|r| r.script_timeout_secs))
+        .unwrap_or(3600);
+
+    let stop_guard = if options.stop_containers {
+        let socket = docker_socket.ok_or_else(|| {
+            Error::Restore(
+                "--stop-containers requested, but [docker].socket is not configured".to_owned(),
+            )
+        })?;
+        let client = docker::Client::connect(socket)?;
+        Some(docker::StopGuard::stop(client, job).await?)
+    } else {
+        None
+    };
+
+    let script_res = run_script_process(
+        script_path,
+        target_path,
+        backup,
+        job,
+        &options.extra_args,
+        timeout_secs,
+        shutdown,
+    )
+    .await;
+
+    if let Some(guard) = stop_guard
+        && let Err(restart_err) = guard.restore().await
+    {
+        tracing::error!(
+            error = %restart_err,
+            "failed to restart containers after restore script"
+        );
+        if script_res.is_ok() {
+            return Err(restart_err);
+        }
+    }
+
+    let is_temporary = options.to.is_none() && !options.force;
+    match script_res {
+        Ok(()) => {
+            if options.cleanup && is_temporary {
+                tracing::info!(
+                    path = %target_path.display(),
+                    "cleaning up temporary restore directory after successful script"
+                );
+                let _ = fs::remove_dir_all(target_path);
+            }
+            Ok(EXIT_SUCCESS)
+        }
+        Err(ScriptRunError::Cancelled) => Err(Error::Cancelled {
+            signal: shutdown
+                .signal()
+                .map_or("shutdown", crate::signal::Signal::as_str),
+        }),
+        Err(ScriptRunError::Failed(code)) => {
+            tracing::error!(
+                path = %target_path.display(),
+                exit_code = code,
+                "restore script exited with non-zero status; extracted directory preserved"
+            );
+            Ok(EXIT_SCRIPT_FAILURE)
+        }
+        Err(ScriptRunError::TimedOut) => {
+            tracing::error!(
+                path = %target_path.display(),
+                timeout_secs,
+                "restore script timed out; extracted directory preserved"
+            );
+            Ok(EXIT_SCRIPT_FAILURE)
+        }
+        Err(ScriptRunError::Io(err)) => {
+            tracing::error!(
+                path = %target_path.display(),
+                error = %err,
+                "restore script execution failed; extracted directory preserved"
+            );
+            Ok(EXIT_SCRIPT_FAILURE)
+        }
+    }
+}
+
+/// Execute the complete restore operation: lock, validate, download, decompress, extract, and run hooks.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Restore`] or [`Error::Storage`] if downloading or extraction fails.
+/// Returns [`Error::Restore`], [`Error::Storage`], or [`Error::Cancelled`].
 pub async fn run_restore(
     op: &Operator,
     job: &JobConfig,
     options: &RestoreOptions,
-) -> Result<PathBuf> {
+    shutdown: &Shutdown,
+    docker_socket: Option<&Path>,
+) -> Result<RestoreOutcome> {
     // 1. Acquire job lock so restore never overlaps backup or prune for the same job.
     let _lock = JobLock::try_acquire(&job.name)?;
 
-    // 2. List backups and select the target backup.
+    // 2. Early validations before any storage operations.
+    let validated_script = resolve_and_validate_script(job, options.script.as_deref())?;
+    validate_stop_containers(job, options.stop_containers, docker_socket)?;
+
+    // 3. List backups and select the target backup.
     let (backups, _) = retention::list_backups(op, job).await?;
     let backup = select_backup(
         &backups,
@@ -491,7 +748,7 @@ pub async fn run_restore(
         options.at.as_deref(),
     )?;
 
-    // 3. Resolve target directory and make it absolute.
+    // 4. Resolve target directory and make it absolute.
     let target_dir = resolve_target_dir(
         job,
         options.to.as_deref(),
@@ -508,12 +765,10 @@ pub async fn run_restore(
         cwd.join(target_dir)
     };
 
-    // 4. Dry-run: print resolved details and exit early without downloading.
+    // 5. Dry-run: print resolved details and exit early without downloading.
     if options.dry_run {
-        let script_display = options
-            .script
-            .as_deref()
-            .or_else(|| job.restore.as_ref().and_then(|r| r.script.as_deref()))
+        let script_display = validated_script
+            .as_ref()
             .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
         println!("job: {}", job.name);
         println!("backup: {}", backup.path);
@@ -521,21 +776,57 @@ pub async fn run_restore(
         println!("timestamp: {}", backup.timestamp.to_rfc3339());
         println!("target dir: {}", abs_target_dir.display());
         println!("script: {script_display}");
-        return Ok(abs_target_dir);
+        return Ok(RestoreOutcome {
+            target_dir: abs_target_dir,
+            exit_code: EXIT_SUCCESS,
+        });
     }
 
-    // 5. Early validation before any storage download.
+    // 6. Early validation of target directory and disk space.
     validate_target_dir(&abs_target_dir, options.force)?;
     check_disk_space(&abs_target_dir, backup.size);
 
-    // 6. Setup extraction / staging directory.
+    // 7. Setup extraction / staging directory.
     let (extract_dir, staging_dir) = prepare_extract_dirs(&abs_target_dir, options.force)?;
 
-    // 7. Download and extract from storage.
-    let extract_result = download_and_extract(op, job, &backup.path, &extract_dir, options).await;
+    // 8. Download and extract from storage.
+    let extract_result =
+        download_and_extract(op, job, &backup.path, &extract_dir, options, shutdown).await;
 
-    // 8. Promote staging or cleanup on failure.
-    promote_or_cleanup_staging(extract_result, &abs_target_dir, staging_dir.as_deref())
+    // 9. Promote staging or cleanup on failure.
+    let target_path =
+        promote_or_cleanup_staging(extract_result, &abs_target_dir, staging_dir.as_deref())?;
+
+    // 10. Execute script hook (or handle --stop-containers if no script).
+    let exit_code = if let Some(ref script_path) = validated_script {
+        execute_restore_hook(
+            script_path,
+            &target_path,
+            backup,
+            job,
+            options,
+            shutdown,
+            docker_socket,
+        )
+        .await?
+    } else {
+        if options.stop_containers {
+            let socket = docker_socket.ok_or_else(|| {
+                Error::Restore(
+                    "--stop-containers requested, but [docker].socket is not configured".to_owned(),
+                )
+            })?;
+            let client = docker::Client::connect(socket)?;
+            let guard = docker::StopGuard::stop(client, job).await?;
+            guard.restore().await?;
+        }
+        EXIT_SUCCESS
+    };
+
+    Ok(RestoreOutcome {
+        target_dir: target_path,
+        exit_code,
+    })
 }
 
 async fn download_and_extract(
@@ -544,6 +835,7 @@ async fn download_and_extract(
     backup_path: &str,
     extract_path: &Path,
     options: &RestoreOptions,
+    shutdown: &Shutdown,
 ) -> Result<()> {
     let reader = op
         .reader(backup_path)
@@ -570,7 +862,7 @@ async fn download_and_extract(
     let configured_compression = job.compression;
     let extract_dir = extract_path.to_path_buf();
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let mut task = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut sync_reader = tokio_util::io::SyncIoBridge::new(async_reader);
 
         let mut magic_buf = [0u8; 4];
@@ -609,9 +901,21 @@ async fn download_and_extract(
             preserve_owner,
             max_extracted_bytes,
         )
-    })
-    .await
-    .map_err(|join_err| Error::archive_other(std::io::Error::other(join_err.to_string())))?
+    });
+
+    tokio::select! {
+        res = &mut task => {
+            res.map_err(|join_err| Error::archive_other(std::io::Error::other(join_err.to_string())))?
+        }
+        () = shutdown.cancelled() => {
+            task.abort();
+            Err(Error::Cancelled {
+                signal: shutdown
+                    .signal()
+                    .map_or("shutdown", crate::signal::Signal::as_str),
+            })
+        }
+    }
 }
 
 fn promote_or_cleanup_staging(
@@ -985,5 +1289,62 @@ mod tests {
             err.to_string().contains("exceeded maximum size limit"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn resolve_and_validate_script_checks() {
+        let job = test_job();
+        assert!(resolve_and_validate_script(&job, None).unwrap().is_none());
+
+        let non_existent = Path::new("/tmp/dvb_test_does_not_exist_xyz.sh");
+        let err = resolve_and_validate_script(&job, Some(non_existent)).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_and_validate_script(&job, Some(tmp.path())).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file_path = tmp.path().join("script.sh");
+            std::fs::write(&file_path, b"#!/bin/sh\necho hi\n").unwrap();
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let err = resolve_and_validate_script(&job, Some(&file_path)).unwrap_err();
+            assert!(err.to_string().contains("not executable"), "{err}");
+
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let resolved = resolve_and_validate_script(&job, Some(&file_path))
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved, file_path);
+        }
+    }
+
+    #[test]
+    fn validate_stop_containers_checks() {
+        let mut job = test_job();
+        assert!(validate_stop_containers(&job, false, None).is_ok());
+
+        // stop_containers requested, but job has no containers configured
+        let err = validate_stop_containers(&job, true, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has no stop_containers or stop_label configured"),
+            "{err}"
+        );
+
+        // job has containers, but no docker socket configured
+        job.stop_containers = vec!["db".to_owned()];
+        let err = validate_stop_containers(&job, true, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[docker].socket is not configured"),
+            "{err}"
+        );
+
+        // job has containers and socket is present
+        let socket = Path::new("/var/run/docker.sock");
+        assert!(validate_stop_containers(&job, true, Some(socket)).is_ok());
     }
 }

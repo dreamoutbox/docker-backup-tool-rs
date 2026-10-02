@@ -10,7 +10,7 @@
 mod cli;
 
 use dvb::config::{self, Config, JobConfig};
-use dvb::{docker, error, job, restore, retention, scheduler, storage};
+use dvb::{docker, error, job, restore, retention, scheduler, signal, storage};
 
 use std::io::IsTerminal as _;
 use std::path::Path;
@@ -200,12 +200,23 @@ async fn restore(
     let job = config.job(job_name)?;
     let op = storage::operator(&job.storage)?;
 
-    let path = restore::run_restore(&op, job, &options).await?;
+    let shutdown = signal::Shutdown::new();
+    shutdown.install();
+
+    let outcome = restore::run_restore(
+        &op,
+        job,
+        &options,
+        &shutdown,
+        config.docker.socket.as_deref(),
+    )
+    .await?;
+
     if !options.dry_run {
-        println!("{}", path.display());
+        println!("{}", outcome.target_dir.display());
     }
 
-    Ok(EXIT_SUCCESS)
+    Ok(outcome.exit_code)
 }
 
 /// `dvb check`: validate the config, then prove each backend works.

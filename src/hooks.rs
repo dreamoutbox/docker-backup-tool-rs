@@ -230,7 +230,7 @@ fn exit_result(hook: &HookConfig, status: ExitStatus) -> Result<()> {
 }
 
 /// Forward one of the child's pipes to the log, line by line.
-async fn pump<R>(reader: Option<R>, stream: &'static str)
+pub(crate) async fn pump<R>(reader: Option<R>, stream: &'static str)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -249,7 +249,7 @@ where
 }
 
 /// Wait briefly for a pump to flush what it already read.
-async fn drain(task: tokio::task::JoinHandle<()>) {
+pub(crate) async fn drain(task: tokio::task::JoinHandle<()>) {
     // A pump that never finishes leaves a task behind until the process exits;
     // that is deliberate, and better than blocking on an inherited pipe.
     let _ = tokio::time::timeout(DRAIN_GRACE, task).await;

@@ -767,3 +767,280 @@ fn restore_lock_prevents_concurrent_operations() {
     assert!(stderr.contains("already locked"), "{stderr}");
     assert!(!target.exists());
 }
+
+#[test]
+fn restore_runs_script_hook_with_args_and_env_vars() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"important data").expect("write data");
+    assert!(f.backup().status.success());
+
+    let marker_path = f.source.parent().unwrap().join("marker.txt");
+    let marker_str = marker_path.display().to_string();
+
+    let script_path = f.source.parent().unwrap().join("hook.sh");
+    let script_content = format!(
+        r#"#!/bin/sh
+cat << EOF > "{marker_str}"
+ARG1=$1
+ARG2=${{2:-none}}
+ARG3=${{3:-none}}
+JOB=$DVB_JOB
+RESTORE_DIR=$DVB_RESTORE_DIR
+ARCHIVE=$DVB_ARCHIVE
+ARCHIVE_TIME=$DVB_ARCHIVE_TIME
+EOF
+"#
+    );
+    std::fs::write(&script_path, script_content).expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let target = f.source.parent().unwrap().join("hook_target");
+    let target_str = target.display().to_string();
+
+    let res = f.restore(&[
+        "--to",
+        &target_str,
+        "--script",
+        &script_path.display().to_string(),
+        "--",
+        "--clean",
+        "extra_val",
+    ]);
+
+    assert!(
+        res.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&res.stdout),
+        String::from_utf8_lossy(&res.stderr)
+    );
+
+    let stdout = String::from_utf8(res.stdout).unwrap();
+    assert_eq!(stdout.trim(), target_str);
+
+    let marker = std::fs::read_to_string(&marker_path).expect("read marker");
+    assert!(marker.contains(&format!("ARG1={target_str}")), "{marker}");
+    assert!(marker.contains("ARG2=--clean"), "{marker}");
+    assert!(marker.contains("ARG3=extra_val"), "{marker}");
+    assert!(marker.contains("JOB=db"), "{marker}");
+    assert!(
+        marker.contains(&format!("RESTORE_DIR={target_str}")),
+        "{marker}"
+    );
+    assert!(marker.contains("ARCHIVE=backups/"), "{marker}");
+    assert!(marker.contains("ARCHIVE_TIME="), "{marker}");
+}
+
+#[test]
+fn restore_missing_or_non_executable_script_fails_before_download() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"data").expect("write");
+    assert!(f.backup().status.success());
+
+    let target = f.source.parent().unwrap().join("fail_target");
+    let target_str = target.display().to_string();
+
+    // 1. Missing script
+    let res = f.restore(&[
+        "--to",
+        &target_str,
+        "--script",
+        "/tmp/dvb_does_not_exist_xyz.sh",
+    ]);
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(!target.exists());
+
+    // 2. Non-executable script
+    let script_path = f.source.parent().unwrap().join("no_exec.sh");
+    std::fs::write(&script_path, b"#!/bin/sh\necho hi\n").expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    let res = f.restore(&[
+        "--to",
+        &target_str,
+        "--script",
+        &script_path.display().to_string(),
+    ]);
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(stderr.contains("not executable"), "{stderr}");
+    assert!(!target.exists());
+}
+
+#[test]
+fn restore_script_failure_returns_exit_code_3_and_preserves_target() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"data").expect("write");
+    assert!(f.backup().status.success());
+
+    let script_path = f.source.parent().unwrap().join("fail_hook.sh");
+    std::fs::write(&script_path, b"#!/bin/sh\necho fail >&2\nexit 42\n").expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let target = f.source.parent().unwrap().join("preserved_target");
+    let target_str = target.display().to_string();
+
+    let res = f.restore(&[
+        "--to",
+        &target_str,
+        "--script",
+        &script_path.display().to_string(),
+    ]);
+
+    assert_eq!(res.status.code(), Some(3));
+    let stdout = String::from_utf8(res.stdout).unwrap();
+    assert_eq!(stdout.trim(), target_str);
+
+    // Extracted directory must still exist with the data
+    assert!(target.join("pgdata/data.txt").exists());
+}
+
+#[test]
+fn restore_script_timeout_kills_process_and_returns_exit_code_3() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"data").expect("write");
+    assert!(f.backup().status.success());
+
+    let script_path = f.source.parent().unwrap().join("sleep_hook.sh");
+    std::fs::write(&script_path, b"#!/bin/sh\nsleep 10\n").expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let target = f.source.parent().unwrap().join("timeout_target");
+    let target_str = target.display().to_string();
+
+    let res = f.restore(&[
+        "--to",
+        &target_str,
+        "--script",
+        &script_path.display().to_string(),
+        "--script-timeout",
+        "1",
+    ]);
+
+    assert_eq!(res.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(stderr.contains("timed out"), "{stderr}");
+    assert!(target.join("pgdata/data.txt").exists());
+}
+
+#[test]
+fn restore_cleanup_semantics() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    std::fs::write(f.source.join("data.txt"), b"data").expect("write");
+    assert!(f.backup().status.success());
+
+    let success_script = f.source.parent().unwrap().join("ok_hook.sh");
+    std::fs::write(&success_script, b"#!/bin/sh\nexit 0\n").expect("write script");
+    std::fs::set_permissions(&success_script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+
+    let fail_script = f.source.parent().unwrap().join("bad_hook.sh");
+    std::fs::write(&fail_script, b"#!/bin/sh\nexit 1\n").expect("write script");
+    std::fs::set_permissions(&fail_script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Case 1: Temporary directory with --cleanup and successful script -> cleaned up
+    let res = f.restore(&[
+        "--script",
+        &success_script.display().to_string(),
+        "--cleanup",
+    ]);
+    assert!(res.status.success());
+    let stdout = String::from_utf8(res.stdout).unwrap();
+    let temp_target = PathBuf::from(stdout.trim());
+    assert!(
+        !temp_target.exists(),
+        "temporary directory should be deleted on success with --cleanup"
+    );
+
+    // Case 2: Temporary directory with --cleanup and failing script -> preserved
+    let res = f.restore(&["--script", &fail_script.display().to_string(), "--cleanup"]);
+    assert_eq!(res.status.code(), Some(3));
+    let stdout = String::from_utf8(res.stdout).unwrap();
+    let temp_target = PathBuf::from(stdout.trim());
+    assert!(
+        temp_target.exists(),
+        "temporary directory should be kept on failure even with --cleanup"
+    );
+
+    // Case 3: Explicit --to with --cleanup -> not deleted (only temporary dirs are cleaned up)
+    let explicit_target = f.source.parent().unwrap().join("explicit_cleanup_target");
+    let target_str = explicit_target.display().to_string();
+    let res = f.restore(&[
+        "--to",
+        &target_str,
+        "--script",
+        &success_script.display().to_string(),
+        "--cleanup",
+    ]);
+    assert!(res.status.success());
+    assert!(
+        explicit_target.exists(),
+        "explicit --to directory should not be removed by --cleanup"
+    );
+
+    // Case 4: --cleanup without script -> does nothing
+    let no_script_target = f.source.parent().unwrap().join("no_script_target");
+    let no_script_str = no_script_target.display().to_string();
+    let res = f.restore(&["--to", &no_script_str, "--cleanup"]);
+    assert!(res.status.success());
+    assert!(
+        no_script_target.exists(),
+        "directory should not be removed when no script was run"
+    );
+}
+
+#[test]
+fn restore_stop_containers_validation_checks() {
+    let f = Fixture::new();
+    let res = f.restore(&["--stop-containers"]);
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("has no stop_containers or stop_label configured"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn example_pg_restore_script_execution_and_help() {
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/pg_restore.sh");
+    assert!(script_path.exists(), "examples/pg_restore.sh must exist");
+
+    // 1. --help exits 0 and displays usage
+    let help_res = std::process::Command::new(&script_path)
+        .arg("--help")
+        .output()
+        .expect("run pg_restore.sh --help");
+    assert!(help_res.status.success());
+    let stdout = String::from_utf8_lossy(&help_res.stdout);
+    assert!(stdout.contains("Usage: pg_restore.sh <extracted-dir>"));
+
+    // 2. Invocation without arguments fails with exit code 1 and error
+    let no_args_res = std::process::Command::new(&script_path)
+        .output()
+        .expect("run pg_restore.sh");
+    assert!(!no_args_res.status.success());
+    let stderr = String::from_utf8_lossy(&no_args_res.stderr);
+    assert!(stderr.contains("Missing extracted directory"));
+
+    // 3. Invocation with empty directory fails identifying missing dump file
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let empty_dir_res = std::process::Command::new(&script_path)
+        .arg(tmp.path())
+        .output()
+        .expect("run pg_restore.sh on empty dir");
+    assert!(!empty_dir_res.status.success());
+    let stderr = String::from_utf8_lossy(&empty_dir_res.stderr);
+    assert!(stderr.contains("No dump file"));
+}
