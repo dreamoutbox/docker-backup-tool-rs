@@ -37,17 +37,26 @@ services:
     environment:
       AWS_ACCESS_KEY_ID: dvbtest
       AWS_SECRET_ACCESS_KEY: dvbtest-secret
+      S3_BUCKET: dvb
     ports:
       - "8333:8333"
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://localhost:8333/status" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   # dvb backup daemon service
   backup:
-    build: .
+    image: dreamoutbox/dvb:latest
     container_name: backup
     restart: unless-stopped
     depends_on:
-      - s3
-      - db
+      s3:
+        condition: service_healthy
+      db:
+        condition: service_started
     volumes:
       # Volumes to back up must be mounted read-only (:ro)
       - pgdata:/backup/pgdata:ro

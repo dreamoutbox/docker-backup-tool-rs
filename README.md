@@ -42,7 +42,7 @@ Run the example environment with Docker Compose:
 
 ```sh
 # Start the backup daemon, database and SeaweedFS S3 gateway
-docker compose -f docker-compose.example.yml up -d
+docker compose -f examples/docker-compose.example.yml up -d
 
 # Inspect scheduled jobs and next fire times
 docker logs backup
@@ -273,7 +273,7 @@ make docker-build   # cargo-chef multi-stage image
 Multi-arch builds with Docker Buildx:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 -t dvb:latest .
+docker buildx build --platform linux/amd64,linux/arm64 -t dreamoutbox/dvb:latest .
 ```
 
 Two scripts sit behind those targets, so the Makefile and a manual run cannot

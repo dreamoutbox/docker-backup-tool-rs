@@ -4,7 +4,7 @@
 # Usage: scripts/build-image.sh [-t TAG] [--no-cache] [-- <extra docker build args>]
 #
 # Examples:
-#   scripts/build-image.sh                      # dvb:latest
+#   scripts/build-image.sh                      # dreamoutbox/dvb:latest
 #   scripts/build-image.sh -t dvb:dev           # custom tag
 #   scripts/build-image.sh --no-cache           # ignore cached layers
 #   scripts/build-image.sh -- --platform linux/arm64
@@ -16,8 +16,8 @@ set -euo pipefail
 
 readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-readonly DEFAULT_TAG="dvb:latest"
-readonly IMAGE="${IMAGE_NAME:-dvb}"
+readonly DEFAULT_TAG="dreamoutbox/dvb:latest"
+readonly IMAGE="${IMAGE_NAME:-dreamoutbox/dvb}"
 readonly PLATFORM="${DOCKER_PLATFORM:-}"
 
 # Print this script's leading comment block as help text.

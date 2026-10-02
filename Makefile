@@ -1,4 +1,4 @@
-IMAGE ?= dvb:latest
+IMAGE ?= dreamoutbox/dvb:latest
 DOCKER ?= docker
 CARGO ?= cargo
 # Tests run one at a time by default; raise it on a machine that can take it.
