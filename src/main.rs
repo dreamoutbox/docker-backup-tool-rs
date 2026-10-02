@@ -7,13 +7,10 @@
 //! * `1` — failure
 //! * `2` — partial: the archive was uploaded but prune or a post hook failed
 
-mod archive;
 mod cli;
-mod config;
-mod error;
-mod job;
-mod lock;
-mod storage;
+
+use dvb::config::{self, Config};
+use dvb::{error, job, retention, storage};
 
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
@@ -23,8 +20,7 @@ use chrono::Utc;
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, GlobalArgs, LogFormat};
-use crate::config::Config;
-use crate::error::{EXIT_FAILURE, Error};
+use dvb::error::{EXIT_FAILURE, Error};
 
 /// Exit code for a completed command.
 const EXIT_SUCCESS: u8 = 0;
@@ -32,6 +28,13 @@ const EXIT_SUCCESS: u8 = 0;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(&cli.global);
+
+    // Must happen before any operator is built: without it the HTTP backends
+    // (s3, dropbox) fail their first request.
+    if let Err(err) = storage::install_transport() {
+        tracing::error!("cannot install the HTTP transport: {err}");
+        return ExitCode::from(EXIT_FAILURE);
+    }
 
     // The runtime is built by hand so `spawn_blocking` (used by the archiver)
     // gets a full multi-threaded blocking pool.
@@ -61,9 +64,9 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     let outcome: error::Result<u8> = match &cli.command {
         Command::Run => Err(Error::NotImplemented("run")),
         Command::Backup { job } => backup(&cli.global, job).await,
-        Command::Prune { .. } => Err(Error::NotImplemented("prune")),
-        Command::List { .. } => Err(Error::NotImplemented("list")),
-        Command::Check => Err(Error::NotImplemented("check")),
+        Command::Prune { job, dry_run } => prune(&cli.global, job, *dry_run).await,
+        Command::List { job } => list(&cli.global, job).await,
+        Command::Check => check(&cli.global).await,
     };
 
     outcome
@@ -76,9 +79,116 @@ async fn backup(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
     let config = Config::load(&global.config)?;
     let job = config.job(job_name)?;
 
-    let op = crate::storage::operator(&job.storage)?;
-    crate::job::run_backup(&op, job, Utc::now()).await?;
+    let op = storage::operator(&job.storage)?;
+    job::run_backup(&op, job, Utc::now()).await?;
 
+    Ok(EXIT_SUCCESS)
+}
+
+/// `dvb prune <job> [--dry-run]`: apply retention without a new backup.
+async fn prune(global: &GlobalArgs, job_name: &str, dry_run: bool) -> error::Result<u8> {
+    let config = Config::load(&global.config)?;
+    let job = config.job(job_name)?;
+    let op = storage::operator(&job.storage)?;
+
+    let plan = retention::prune(&op, job, Utc::now(), dry_run).await?;
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    // The plan goes to stdout so it can be piped; logs stay on stderr.
+    println!(
+        "{}: {verb} {}, {}",
+        job.name,
+        plan.delete_count(),
+        plan.summary()
+    );
+    for backup in &plan.expired {
+        println!("  {}", backup.path);
+    }
+
+    Ok(EXIT_SUCCESS)
+}
+
+/// `dvb list <job>`: what is stored, with the timestamp parsed from the name.
+async fn list(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
+    let config = Config::load(&global.config)?;
+    let job = config.job(job_name)?;
+    let op = storage::operator(&job.storage)?;
+
+    let (backups, ignored) = retention::list_backups(&op, job).await?;
+
+    if backups.is_empty() {
+        println!("no backups found for job `{}`", job.name);
+    }
+    for backup in &backups {
+        println!(
+            "{}\t{}\t{}",
+            backup.timestamp.to_rfc3339(),
+            backup.size,
+            backup.path
+        );
+    }
+    if !ignored.is_empty() {
+        tracing::warn!(
+            count = ignored.len(),
+            "ignored objects under the prefix that do not match the job's filename pattern"
+        );
+    }
+
+    Ok(EXIT_SUCCESS)
+}
+
+/// `dvb check`: validate the config, then prove each backend works.
+///
+/// Storage is checked with a real round trip (write, read, delete) rather than
+/// just a list, because list succeeds on many backends where write needs
+/// different permissions.
+async fn check(global: &GlobalArgs) -> error::Result<u8> {
+    let config = Config::load(&global.config)?;
+    println!("configuration at {} is valid", global.config.display());
+    println!("{} job(s) defined", config.job_count());
+
+    let mut failures = 0_usize;
+    for job in &config.jobs {
+        println!("\njob `{}` ({} backend)", job.name, job.storage.kind());
+
+        match storage::operator(&job.storage) {
+            Ok(op) => match storage::probe(&op, job.storage.kind()).await {
+                Ok(()) => println!("  storage: ok"),
+                Err(err) => {
+                    println!("  storage: FAILED: {err:#}");
+                    failures += 1;
+                }
+            },
+            Err(err) => {
+                println!("  storage: FAILED to configure: {err}");
+                failures += 1;
+            }
+        }
+
+        // Retention input: is the prefix listable and are existing backups
+        // parseable? Reported, not fatal, since an empty prefix is normal.
+        match retention::list_backups(&storage::operator(&job.storage)?, job).await {
+            Ok((backups, ignored)) => {
+                println!("  backups: {} stored", backups.len());
+                if !ignored.is_empty() {
+                    println!(
+                        "  warning: {} object(s) under the prefix do not match the filename \
+                         pattern and will never be pruned: {:?}",
+                        ignored.len(),
+                        ignored
+                    );
+                }
+            }
+            Err(err) => {
+                println!("  backup listing: FAILED: {err:#}");
+                failures += 1;
+            }
+        }
+    }
+
+    if failures > 0 {
+        return Err(Error::CheckFailed { failures });
+    }
+    println!("\nall checks passed");
     Ok(EXIT_SUCCESS)
 }
 
@@ -149,7 +259,7 @@ mod tests {
 
     #[test]
     fn not_yet_implemented_commands_fail() {
-        let cli = Cli::parse_from(["dvb", "check"]);
+        let cli = Cli::parse_from(["dvb", "run"]);
         let err = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime")

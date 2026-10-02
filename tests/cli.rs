@@ -39,19 +39,12 @@ fn global_flags_accept_the_documented_env_vars() {
 
 #[test]
 fn not_yet_implemented_subcommands_exit_with_failure() {
-    for args in [
-        vec!["run"],
-        vec!["prune", "db"],
-        vec!["list", "db"],
-        vec!["check"],
-    ] {
-        dvb()
-            .args(args)
-            .assert()
-            .failure()
-            .code(1)
-            .stderr(predicates::str::contains("not implemented yet"));
-    }
+    dvb()
+        .arg("run")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("not implemented yet"));
 }
 
 #[test]

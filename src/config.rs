@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone as _, Utc};
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,10 @@ const fn default_stop_timeout() -> u64 {
     30
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Archive compression algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -137,6 +141,7 @@ pub enum Compression {
 
 impl Compression {
     /// File extension that matches this compression, if any.
+    #[must_use]
     pub const fn extension(self) -> Option<&'static str> {
         match self {
             Self::Zstd => Some("zst"),
@@ -153,12 +158,14 @@ impl Compression {
 
     /// zstd level used for [`Compression::Zstd`], as accepted by
     /// `zstd::stream::write::Encoder`.
+    #[must_use]
     pub const fn zstd_level() -> i32 {
         Self::ZSTD_LEVEL
     }
 
     /// gzip level used for [`Compression::Gzip`], as accepted by
     /// `flate2::write::GzEncoder`.
+    #[must_use]
     pub const fn gzip_level() -> u32 {
         Self::GZIP_LEVEL
     }
@@ -220,6 +227,7 @@ pub enum StorageConfig {
 
 impl StorageConfig {
     /// Backend name, for logs and error messages.
+    #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Fs(_) => "fs",
@@ -230,6 +238,7 @@ impl StorageConfig {
     }
 
     /// Key prefix prepended to every object name for this job.
+    #[must_use]
     pub fn prefix(&self) -> &str {
         match self {
             Self::Fs(cfg) => &cfg.prefix,
@@ -240,6 +249,7 @@ impl StorageConfig {
     }
 
     /// Full remote path for `object`, honouring the prefix.
+    #[must_use]
     pub fn remote_path(&self, object: &str) -> String {
         let prefix = self.prefix().trim_matches('/');
         if prefix.is_empty() {
@@ -277,40 +287,46 @@ pub struct S3Config {
     pub access_key_id: Option<SecretString>,
     #[serde(default)]
     pub secret_access_key: Option<SecretString>,
-    /// Required by `MinIO` and most non-AWS S3 implementations.
-    #[serde(default)]
+    /// Address the bucket as a path segment (`endpoint/bucket/key`) rather than
+    /// as a subdomain (`bucket.endpoint/key`).
+    ///
+    /// Path style is the default and is what `MinIO` and most S3-compatible
+    /// services need. Set this to `false` for virtual-host style, which some
+    /// providers require.
+    #[serde(default = "default_true")]
     pub force_path_style: bool,
 }
 
 /// `sftp` backend settings.
-///
-/// Parsed and validated in phase 1; the operator is built in phase 2.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct SftpConfig {
     /// `host:port`.
     pub endpoint: String,
+    /// Remote user.
     pub user: String,
     /// Remote directory that acts as the archive root.
     pub root: String,
-    /// Private key file; falls back to `ssh` defaults when absent.
+    /// Private key file. When absent, `ssh`'s own defaults apply (agent,
+    /// `~/.ssh/config`, `~/.ssh/id_*`).
     #[serde(default)]
     pub key_path: Option<PathBuf>,
-    #[serde(default)]
-    pub password: Option<SecretString>,
     /// `strict` (default) or `accept_new`.
     #[serde(default)]
     pub known_hosts_strategy: KnownHostsStrategy,
 }
 
 /// How unknown SSH host keys are handled.
+///
+/// The underlying `openssh` session is always given a check strategy; there is
+/// deliberately no way to disable host key verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KnownHostsStrategy {
     /// Refuse to connect to unknown hosts (default).
     #[default]
     Strict,
-    /// Add unknown hosts on first use.
+    /// Add unknown hosts to `known_hosts` on first use.
     AcceptNew,
 }
 
@@ -343,11 +359,13 @@ impl SecretString {
     }
 
     /// Read the secret. Call sites should be few and obvious.
+    #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
     }
 
     /// Whether the secret is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -373,6 +391,12 @@ impl From<&str> for SecretString {
 
 impl Config {
     /// Load, merge and validate the configuration file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Read`] if the file cannot be read, [`ConfigError::Parse`]
+    /// if it is not valid TOML or has an unexpected shape, and
+    /// [`ConfigError::Invalid`] if it parses but a job does not make sense.
     pub fn load(path: &Path) -> Result<Self> {
         let figment = Figment::new()
             .merge(Toml::file(path))
@@ -388,6 +412,11 @@ impl Config {
     }
 
     /// Look up a job by name.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownJob`], listing the configured job names, when no job
+    /// matches.
     pub fn job(&self, name: &str) -> Result<&JobConfig> {
         self.jobs
             .iter()
@@ -405,6 +434,7 @@ impl Config {
 
     /// Number of configured jobs. Used by `dvb check` from phase 2 on.
     #[allow(dead_code)]
+    #[must_use]
     pub fn job_count(&self) -> usize {
         self.jobs.len()
     }
@@ -412,6 +442,13 @@ impl Config {
     /// Structural validation: names unique and non-empty, cron parses,
     /// filename contains a second-resolution timestamp, retention sane,
     /// source list non-empty and duplicate basenames rejected.
+    ///
+    /// This is pure: it touches no filesystem, so it is safe to call at load
+    /// time and from tests alike.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first problem found.
     pub fn validate(&self) -> Result<()> {
         if self.jobs.is_empty() {
             return Err(invalid("no [[job]] defined"));
@@ -433,6 +470,11 @@ impl Config {
 
 impl JobConfig {
     /// Validate a single job.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first problem found, prefixed with
+    /// the job name so a bad job among many is easy to spot.
     pub fn validate(&self) -> Result<()> {
         if let Some(cron) = &self.cron {
             parse_cron(cron).map_err(|err| {
@@ -530,11 +572,13 @@ impl JobConfig {
 
     /// Whether this job wants containers stopped for consistency.
     #[allow(dead_code)] // read by job.rs/docker.rs in phase 3
+    #[must_use]
     pub fn wants_stop(&self) -> bool {
         !self.stop_containers.is_empty() || self.stop_label.is_some()
     }
 
     /// Render the remote object name for `now`, in UTC.
+    #[must_use]
     pub fn object_name(&self, now: DateTime<Utc>) -> String {
         let rendered = now.format(&self.filename).to_string();
         match self.compression.extension() {
@@ -564,6 +608,9 @@ impl JobConfig {
     #[allow(dead_code)] // read by retention.rs in phase 2
     fn split_object_name<'a>(&self, object: &'a str) -> Option<&'a str> {
         let name = object.rsplit('/').next().unwrap_or(object);
+
+        // `object_name` appends the compression extension unless the template
+        // already spells it out, so exactly one `.ext` comes off here.
         let stem = match self.compression.extension() {
             Some(ext) => name.strip_suffix(&format!(".{ext}")).unwrap_or(name),
             None => name,
@@ -582,33 +629,57 @@ impl JobConfig {
     /// Returns `None` when the name does not match the job's template, which is
     /// how unrelated files under the prefix are left alone.
     #[allow(dead_code)] // read by retention.rs in phase 2
+    #[must_use]
     pub fn parse_object_name(&self, object: &str) -> Option<DateTime<Utc>> {
         let stem = self.split_object_name(object)?;
-        // The template's leading literal was already stripped, so strip the
-        // same literal length from the format string before parsing.
-        let format = self.strip_literal_prefix();
+        let format = self.stem_format()?;
         if format.is_empty() {
             return None;
         }
-        DateTime::parse_from_str(stem, &format)
+        // `NaiveDateTime`, not `DateTime`: the template's `Z` is a literal
+        // character, not a chrono offset specifier, and `DateTime::parse_from_str`
+        // would demand a real `%z`. Object names are always rendered in UTC by
+        // `object_name`, so interpreting the stem as UTC is exact.
+        chrono::NaiveDateTime::parse_from_str(stem, &format)
             .ok()
-            .map(|dt| dt.with_timezone(&Utc))
+            .map(|naive| Utc.from_utc_datetime(&naive))
     }
 
-    /// The filename template without its leading literal characters, leaving a
-    /// chrono format string that parses the stem of an object name.
+    /// The part of the template that follows the leading literal and precedes
+    /// the compression extension: a chrono format string that parses the stem
+    /// left by [`Self::split_object_name`].
+    ///
+    /// `db-%Y%m%dT%H%M%SZ.tar.zst` with zstd gives `%Y%m%dT%H%M%SZ.tar`, which
+    /// parses `20240301T010203Z.tar` out of `db-20240301T010203Z.tar.zst`.
     #[allow(dead_code)] // read by retention.rs in phase 2
-    fn strip_literal_prefix(&self) -> String {
+    fn stem_format(&self) -> Option<String> {
         let end = self
             .filename
             .char_indices()
             .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '-'))
             .map_or(self.filename.len(), |(idx, _)| idx);
-        self.filename[end..].to_owned()
+        let mut format = self.filename[end..].to_owned();
+
+        // Drop the trailing `.ext` only when the template carries it, matching
+        // what `object_name` did on the way out.
+        if let Some(ext) = self.compression.extension() {
+            let suffix = format!(".{ext}");
+            if format.ends_with(&suffix) {
+                format.truncate(format.len() - suffix.len());
+            }
+        }
+
+        // A format with no conversion specifier would match anything, which
+        // would let unrelated files be treated as backups.
+        if !format.contains('%') {
+            return None;
+        }
+        Some(format)
     }
 
     /// Whether an object name looks like a backup produced by this job.
     #[allow(dead_code)] // read by retention.rs in phase 2
+    #[must_use]
     pub fn matches_object_name(&self, object: &str) -> bool {
         self.parse_object_name(object).is_some()
     }
@@ -618,6 +689,11 @@ impl JobConfig {
 ///
 /// Seconds are optional so `"0 3 * * *"` means 03:00:00, not a six field
 /// pattern starting at second 0.
+///
+/// # Errors
+///
+/// Returns `croner`'s parse error when the expression is not a valid five or six
+/// field pattern.
 pub fn parse_cron(
     expression: &str,
 ) -> std::result::Result<croner::Cron, croner::errors::CronError> {

@@ -67,6 +67,12 @@ impl Source {
 /// Tar + compress `sources` into `writer`, returning what was written.
 ///
 /// This blocks; use [`stream_to`] to drive it from async code.
+///
+/// # Errors
+///
+/// Any IO error while reading a source, writing the archive or flushing the
+/// compressor is returned as [`Error::Archive`]. Unreadable files are never
+/// skipped: a partial backup is worse than a failed one.
 pub fn write_archive<W: Write>(
     sources: &[Source],
     writer: W,
@@ -285,8 +291,13 @@ impl ChunkSink for Vec<u8> {
 /// Tar + compress `sources` on the blocking pool, piping the bytes into `sink`.
 ///
 /// Returns the tar stats plus the number of compressed bytes handed to `sink`.
-/// Read errors on the source side surface as [`Error::Archive`]; a sink error is
-/// wrapped the same way around its underlying cause.
+///
+/// # Errors
+///
+/// Read errors on the source side surface as [`Error::Archive`] naming the path;
+/// a sink error is wrapped the same way around its underlying cause. A source
+/// error is reported in preference to a sink error, since a truncated pipe also
+/// looks like a short read.
 pub async fn stream_to<S: ChunkSink>(
     sources: Vec<Source>,
     mut sink: S,

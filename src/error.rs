@@ -60,6 +60,10 @@ pub enum Error {
     /// A storage backend could not be built from the configuration.
     #[error("invalid storage configuration: {0}")]
     StorageConfig(String),
+
+    /// `dvb check` found at least one broken job.
+    #[error("{failures} check(s) failed")]
+    CheckFailed { failures: usize },
 }
 
 /// Errors raised while loading or validating the configuration file.
@@ -97,6 +101,7 @@ impl Error {
     }
 
     /// Build an archive error without a specific path.
+    #[must_use]
     pub fn archive_other(source: std::io::Error) -> Self {
         Self::Archive {
             context: None,
@@ -106,6 +111,7 @@ impl Error {
 
     /// Recover the underlying IO error, so a sink failure can be re-wrapped with
     /// the caller's own context.
+    #[must_use]
     pub fn into_io(self) -> std::io::Error {
         match self {
             Self::Archive { source, .. } | Self::Io { source, .. } => source,

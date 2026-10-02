@@ -19,6 +19,7 @@ pub const DEFAULT_LOCK_DIR: &str = "/run/dvb";
 pub const ENV_LOCK_DIR: &str = "DVB_LOCK_DIR";
 
 /// Directory holding lock files: `DVB_LOCK_DIR` or [`DEFAULT_LOCK_DIR`].
+#[must_use]
 pub fn lock_dir() -> PathBuf {
     lock_dir_from(std::env::var_os(ENV_LOCK_DIR).as_deref())
 }
@@ -33,6 +34,7 @@ fn lock_dir_from(env_value: Option<&std::ffi::OsStr>) -> PathBuf {
 
 /// Path of the lock file for `job`, in the configured lock directory.
 #[allow(dead_code)] // used by log lines from phase 4 on
+#[must_use]
 pub fn lock_path(job: &str) -> PathBuf {
     lock_path_in(&lock_dir(), job)
 }
@@ -58,12 +60,21 @@ impl JobLock {
     /// Take the lock for `job`, failing immediately when another process holds it.
     ///
     /// The lock directory is created if missing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Locked`] when the lock is held elsewhere, and [`Error::Io`] when
+    /// the directory or file cannot be opened.
     #[allow(dead_code)] // used by `dvb backup`; tests use the explicit-dir form
     pub fn try_acquire(job: &str) -> Result<Self> {
         Self::try_acquire_in(&lock_dir(), job)
     }
 
     /// [`Self::try_acquire`] against an explicit directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_acquire`].
     pub fn try_acquire_in(dir: &Path, job: &str) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|source| Error::Io {
             path: dir.to_path_buf(),
@@ -105,12 +116,14 @@ impl JobLock {
 
     /// Job this lock belongs to.
     #[allow(dead_code)]
+    #[must_use]
     pub fn job(&self) -> &str {
         &self.job
     }
 
     /// Path of the lock file, for error messages.
     #[allow(dead_code)]
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -121,6 +134,7 @@ impl JobLock {
 /// Only used for diagnostics and tests; probing means taking the lock, so this
 /// momentarily contends with a real acquire.
 #[allow(dead_code)]
+#[must_use]
 pub fn is_locked(job: &str) -> bool {
     is_locked_in(&lock_dir(), job)
 }

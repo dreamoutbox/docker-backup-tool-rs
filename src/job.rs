@@ -34,6 +34,7 @@ pub fn sources(job: &JobConfig) -> Vec<Source> {
 }
 
 /// Build the [`ArchiveOptions`] for a job.
+#[must_use]
 pub fn archive_options(job: &JobConfig) -> ArchiveOptions {
     ArchiveOptions {
         compression: job.compression,
@@ -44,9 +45,15 @@ pub fn archive_options(job: &JobConfig) -> ArchiveOptions {
 /// Run one backup for `job` at `now`.
 ///
 /// The lock is taken first so a concurrent `docker exec dvb backup` or a
-/// scheduler fire cannot overlap. Any failure after the upload started removes
-/// the partial object, so storage never holds a truncated archive that looks
-/// like a valid backup.
+/// scheduler fire cannot overlap.
+///
+/// # Errors
+///
+/// [`Error::Locked`] when another process holds the job lock,
+/// [`Error::Archive`] when a source cannot be read, and [`Error::Storage`] when
+/// the backend refuses an operation. Any failure after the upload started
+/// removes the partial object, so storage never holds a truncated archive that
+/// looks like a valid backup.
 pub async fn run_backup(
     op: &Operator,
     job: &JobConfig,
@@ -58,7 +65,12 @@ pub async fn run_backup(
 /// [`run_backup`] taking the lock from an explicit directory.
 ///
 /// The scheduler needs to distinguish "another process holds the lock, skip this
-/// fire" from a real failure, which this returns as [`Error::Locked`].
+/// fire" from a real failure, which this reports as [`Error::Locked`].
+///
+/// # Errors
+///
+/// As [`run_backup`], plus [`Error::Io`] when the lock directory or file cannot
+/// be opened.
 pub async fn try_run_backup(
     op: &Operator,
     job: &JobConfig,

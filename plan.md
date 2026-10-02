@@ -112,7 +112,7 @@ docker-compose.example.yml
 
 ---
 
-## Phase 0: Project scaffold and Docker build (cargo-chef)
+## Phase 0: Project scaffold and Docker build (cargo-chef) (DONE)
 
 Goal: compiling skeleton plus a fast, cached, multi-stage image build from day one.
 
@@ -179,7 +179,7 @@ Acceptance criteria:
 
 ---
 
-## Phase 1: Config, archive, local storage, lock
+## Phase 1: Config, archive, local storage, lock (DONE)
 
 Goal: `dvb backup <job>` works end to end against the `fs` backend.
 

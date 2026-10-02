@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
-use crate::config::DEFAULT_CONFIG_PATH;
+use dvb::config::DEFAULT_CONFIG_PATH;
 
 #[derive(Debug, Parser)]
 #[command(
