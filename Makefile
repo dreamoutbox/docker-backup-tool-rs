@@ -25,10 +25,10 @@ lint: ## Clippy only
 	$(CARGO) clippy --all-targets -- -D warnings
 
 test: ## Run the suite serially (nextest, -j $(JOBS))
-	./scripts/run-tests.sh -j $(JOBS) $(if $(filter 1,$(ALL)),--all)
+	./scripts/test.sh -j $(JOBS) $(if $(filter 1,$(ALL)),--all) $(TEST)
 
 test-all: ## Run the suite including the testcontainer-backed tests
-	./scripts/run-tests.sh -j $(JOBS) --all
+	./scripts/test.sh -j $(JOBS) --all $(TEST)
 
 build: ## Release build of the dvb binary
 	$(CARGO) build --release --locked --bin dvb

@@ -10,17 +10,6 @@ a scheduler daemon (`dvb run`) or as a one-shot CLI invoked through
 Implementation is in progress; `plan.md` holds the phased plan and the status of
 each phase.
 
-## Status
-
-| Phase | Scope | State |
-|---|---|---|
-| 0 | Project scaffold, CLI skeleton, Docker build | done |
-| 1 | Config, archiving, `fs` storage, job locks | done |
-| 2 | S3/SFTP backends, retention, `list`/`prune`/`check` | done |
-| 3 | Docker stop/start, pre/post hooks | done |
-| 4 | Scheduler daemon, graceful shutdown | done |
-| 5 | Dropbox backend, `stage = "local"` | not started |
-
 ## Commands
 
 | Command | Effect |
@@ -52,6 +41,10 @@ docker exec backup dvb backup db
 
 # List stored backups
 docker exec backup dvb list db
+
+# Inspect backups in the browser (SeaweedFS Filer UI)
+# Open http://localhost:8888/buckets/dvb/
+# SeaweedFS Master cluster dashboard is at http://localhost:9333/
 
 # Test retention policy without deleting files
 docker exec backup dvb prune db --dry-run

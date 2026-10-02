@@ -20,7 +20,7 @@ dvb restore <job>
     [--script <path>]            # run: <script> <abs-extracted-dir> [extra args]
     [--script-timeout <secs>]    # default 3600
     [--force]                    # allow extracting into an existing non-empty dir
-    [--cleanup]                  # delete extracted dir after the script succeeds
+    [--cleanup]                  # delete extracted dir after the script succeeds (default: true)
     [--stop-containers]          # stop the job's stop_containers while the script runs
     [--no-verify]                # skip checksum verification (Phase 9)
     [--dry-run]                  # resolve the backup and print the plan, change nothing

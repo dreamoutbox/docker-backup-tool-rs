@@ -6,7 +6,7 @@
 # OOM on a small machine. Raise the job count only when you know the machine can
 # take it.
 #
-# Usage: scripts/run-tests.sh [-j N] [--all] [-- <extra nextest args>]
+# Usage: scripts/test.sh [-j N] [--all] [test_name]... [-- <extra nextest args>]
 #
 #   -j, --jobs N     number of tests to run concurrently (default: 1)
 #       --all        also run the #[ignore]d container tests (needs Docker)
@@ -14,10 +14,11 @@
 #   -h, --help       show this help
 #
 # Examples:
-#   scripts/run-tests.sh                  # serial, fast, no Docker needed
-#   scripts/run-tests.sh -j 4             # four at a time
-#   scripts/run-tests.sh --all            # plus the S3 and SFTP containers
-#   scripts/run-tests.sh --all -j 2       # containers, two at a time
+#   scripts/test.sh                               # serial, fast, no Docker needed
+#   scripts/test.sh -j 4                          # four at a time
+#   scripts/test.sh --all                         # plus the S3 and SFTP containers
+#   scripts/test.sh uploads_lists_and_prunes      # run a specific test by name
+#   scripts/test.sh --all -j 2                    # containers, two at a time
 #
 # Container tests are capped at 0.5 CPU and 512 MiB each; see
 # tests/support/mod.rs and DVB_TEST_CPU / DVB_TEST_MEM_MB.
@@ -29,6 +30,7 @@ readonly NEXTEST="cargo nextest"
 
 jobs=1
 all=""
+filters=()
 extra_args=()
 
 # Print this script's leading comment block as help text.
@@ -65,8 +67,12 @@ while [[ $# -gt 0 ]]; do
             extra_args=("$@")
             break
             ;;
+        -*)
+            die "unknown option: $1"
+            ;;
         *)
-            die "unknown argument: $1"
+            filters+=("$1")
+            shift
             ;;
     esac
 done
@@ -82,9 +88,21 @@ fi
 
 cd "${REPO_ROOT}"
 
-echo "running tests with ${jobs} job(s)${all:+, including ignored container tests}"
+# If specific test filters are supplied, include ignored tests so targeted
+# container tests can run without having to pass --all explicitly.
+if [[ ${#filters[@]} -gt 0 && -z "${all}" ]]; then
+    all="--run-ignored all"
+fi
+
+filter_desc=""
+if [[ ${#filters[@]} -gt 0 ]]; then
+    filter_desc=" matching ${filters[*]}"
+fi
+
+echo "running tests${filter_desc} with ${jobs} job(s)${all:+, including ignored container tests}"
 # shellcheck disable=SC2086 # ${all} is an intentional two-word flag
 exec ${NEXTEST} run \
     --jobs "${jobs}" \
     ${all} \
-    "${extra_args[@]}"
+    ${filters[@]+"${filters[@]}"} \
+    ${extra_args[@]+"${extra_args[@]}"}

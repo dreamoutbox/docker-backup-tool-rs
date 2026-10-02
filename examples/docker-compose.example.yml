@@ -9,6 +9,10 @@
 # Listing remote backups:
 #   docker exec backup dvb list db
 #
+# Inspecting backups via Web Dashboard:
+#   SeaweedFS Filer (file browser): http://localhost:8888/buckets/dvb/
+#   SeaweedFS Master (cluster info): http://localhost:9333/
+#
 # Dry-run retention prune:
 #   docker exec backup dvb prune db --dry-run
 #
@@ -39,7 +43,9 @@ services:
       AWS_SECRET_ACCESS_KEY: dvbtest-secret
       S3_BUCKET: dvb
     ports:
-      - "8333:8333"
+      - "8333:8333" # S3 API
+      - "8888:8888" # SeaweedFS Filer Web UI (browse buckets and files)
+      - "9333:9333" # SeaweedFS Master Web UI (cluster status)
     healthcheck:
       test: [ "CMD", "curl", "-sf", "http://localhost:8333/status" ]
       interval: 5s

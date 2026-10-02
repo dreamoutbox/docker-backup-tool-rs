@@ -33,9 +33,17 @@ const UPLOAD_DIR: &str = "backups";
 const SFTP_PORT: u16 = 22;
 
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
-        .join(name)
+        .join(name);
+    #[cfg(unix)]
+    if name == "sftp_test_key" && path.exists() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Git cannot store 0600 mode in the tree. OpenSSH rejects private
+        // keys that are group- or world-readable (0644).
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    path
 }
 
 /// A running SFTP server reachable with the test key.
