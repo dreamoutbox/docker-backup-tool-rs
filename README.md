@@ -18,37 +18,67 @@ each phase.
 | 1 | Config, archiving, `fs` storage, job locks | done |
 | 2 | S3/SFTP backends, retention, `list`/`prune`/`check` | done |
 | 3 | Docker stop/start, pre/post hooks | done |
-| 4 | Scheduler daemon, graceful shutdown | not started |
+| 4 | Scheduler daemon, graceful shutdown | done |
 | 5 | Dropbox backend, `stage = "local"` | not started |
 
 ## Commands
 
 | Command | Effect |
 |---|---|
+| `dvb run` | Run the scheduler daemon and execute jobs on their cron schedules |
 | `dvb backup <job>` | Archive the job's sources to storage, right now |
 | `dvb list <job>` | List stored backups with their size and parsed timestamp |
 | `dvb prune <job> [--dry-run]` | Apply the retention policy without a new backup |
 | `dvb check` | Validate the config and round-trip each backend |
-
-`dvb run` (the scheduler daemon) is not implemented yet.
 
 Exit codes: `0` success, `1` failure, `2` partial — the archive reached storage
 but a post hook or the retention pass failed. A failed run never leaves a
 partial object behind, so a truncated archive cannot be mistaken for a good
 backup.
 
+## Quick Start
+
+Run the example environment with Docker Compose:
+
+```sh
+# Start the backup daemon, database and SeaweedFS S3 gateway
+docker compose -f docker-compose.example.yml up -d
+
+# Inspect scheduled jobs and next fire times
+docker logs backup
+
+# Trigger an immediate one-shot backup while the daemon is running
+docker exec backup dvb backup db
+
+# List stored backups
+docker exec backup dvb list db
+
+# Test retention policy without deleting files
+docker exec backup dvb prune db --dry-run
+```
+
 ## Configuration
 
 TOML, at `/etc/dvb/config.toml` by default.
 
 ```toml
+# Top-level settings
+shutdown_grace_secs = 60                       # wait up to 60s for running jobs on SIGTERM
+
+[docker]
+socket = "/var/run/docker.sock"                # optional; enables container stop/start/exec
+
 [[job]]
 name = "db"
-source = ["/backup/pgdata"]                     # paths inside this container
-filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"      # must contain %Y and %S
-compression = "zstd"                            # zstd | gzip | none
+cron = "0 3 * * *"                             # 5-field cron, evaluated in TZ (default UTC)
+run_on_start = true                            # take an initial backup when daemon starts
+source = ["/backup/pgdata"]                    # paths inside this container
+filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"     # must contain %Y and %S
+compression = "zstd"                           # zstd | gzip | none
 retention_days = 14
 min_keep = 3
+stop_containers = ["postgres"]                 # stop while archiving for consistency
+stop_timeout_secs = 30
 
   [job.storage]
   type = "fs"
@@ -62,6 +92,9 @@ table and the job silently loses its backend.
 
 `filename` must contain a second-resolution timestamp (`%Y` and `%S`) because
 retention parses the timestamp back out of the object name.
+
+Jobs are scheduled according to the `TZ` environment variable (default `UTC`), e.g.
+`TZ=America/New_York` or `TZ=Europe/Berlin`.
 
 ### Storage backends
 
@@ -185,6 +218,37 @@ which drops the archiver, removes the partial object, restarts whatever was
 stopped, runs the post hooks, and only then exits non-zero. A second signal
 cannot interrupt that cleanup.
 
+In daemon mode (`dvb run`), `SIGTERM` stops scheduling new runs and waits up to
+`shutdown_grace_secs` (default 60s) for active jobs to finish before cancelling them.
+
+### Database consistency
+
+Hot-copying raw database files (PostgreSQL `base/`, MySQL `ibdata1`, SQLite `.db`) from
+live containers is unsafe: files can be modified in mid-read or in-memory caches may
+not be flushed to disk, producing corrupt archives that fail on restore.
+
+Ensure consistency by either:
+1. Stopping the container during backup with `stop_containers = ["db"]` or
+   `stop_label = "dvb.stop"`, so the database engine shuts down cleanly before
+   files are archived; OR
+2. Taking a logical dump via a container pre-hook:
+   ```toml
+   [[job.pre]]
+   cmd = ["pg_dump", "-U", "postgres", "-f", "/backup/pgdata/dump.sql"]
+   container = "db"
+   ```
+
+### Security notes
+
+The Docker socket `/var/run/docker.sock` provides root-equivalent host access.
+Mounting it `:ro` does NOT restrict API actions: any process that can write to the socket
+stream can issue container exec/stop/start calls.
+
+For production setups with strict isolation, consider using `docker-socket-proxy`
+with only the necessary API endpoints enabled:
+- `CONTAINERS=1`
+- `POST=1`
+
 ## Retention
 
 A backup is deleted when it is both older than `retention_days` **and** outside
@@ -204,6 +268,12 @@ reported rather than skipped.
 make check          # cargo fmt --check + clippy -D warnings + tests
 make openssl-check  # fails if openssl/native-tls sneak into the tree
 make docker-build   # cargo-chef multi-stage image
+```
+
+Multi-arch builds with Docker Buildx:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -t dvb:latest .
 ```
 
 Two scripts sit behind those targets, so the Makefile and a manual run cannot
@@ -235,7 +305,7 @@ The S3, SFTP and Docker tests need Docker and are `#[ignore]`d; `--all` (or
 
 ```sh
 scripts/run-tests.sh --all                      # everything, serially
-cargo test --test s3_minio -- --ignored         # just the SeaweedFS gateway
+cargo test --test s3_test -- --ignored         # just the SeaweedFS gateway
 cargo test --test sftp -- --ignored             # just atmoz/sftp
 cargo test --test docker_hooks -- --ignored     # stop/start, hooks, SIGTERM
 ```

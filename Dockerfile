@@ -25,10 +25,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---- Stage 4: runtime ----
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates openssh-client tzdata \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /run/dvb /etc/dvb
+    && apt-get install -y --no-install-recommends ca-certificates openssh-client tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/dvb /etc/dvb
 COPY --from=builder /app/target/release/dvb /usr/local/bin/dvb
+LABEL org.opencontainers.image.title="dvb" \
+    org.opencontainers.image.description="Docker volume backup tool: tar+compress mounted paths and stream them to object storage" \
+    org.opencontainers.image.licenses="MIT"
 ENV TZ=UTC
 # Runs as root on purpose: it must be able to read arbitrary mounted volumes and
 # talk to the Docker socket. Override with `user:` for read-only volume setups

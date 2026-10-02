@@ -3,7 +3,7 @@
 //! These need Docker, so they are `#[ignore]`d by default:
 //!
 //! ```sh
-//! cargo test --test s3_minio -- --ignored
+//! cargo test --test s3_test -- --ignored
 //! ```
 //!
 //! (`MinIO` is gone from Docker Hub, so this runs `SeaweedFS`'s S3 gateway
@@ -169,7 +169,7 @@ fn dvb(dir: &std::path::Path) -> Command {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with cargo test --test s3_minio -- --ignored"]
+#[ignore = "needs Docker; run with cargo test --test s3_test -- --ignored"]
 async fn uploads_an_archive_and_lists_it() {
     let seaweed = SeaweedS3::start().await;
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -246,7 +246,7 @@ async fn uploads_an_archive_and_lists_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with cargo test --test s3_minio -- --ignored"]
+#[ignore = "needs Docker; run with cargo test --test s3_test -- --ignored"]
 async fn uploads_an_archive_larger_than_one_multipart_part() {
     let seaweed = SeaweedS3::start().await;
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -302,7 +302,7 @@ async fn uploads_an_archive_larger_than_one_multipart_part() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with cargo test --test s3_minio -- --ignored"]
+#[ignore = "needs Docker; run with cargo test --test s3_test -- --ignored"]
 async fn check_reports_the_backend_as_working() {
     let seaweed = SeaweedS3::start().await;
     let tmp = tempfile::tempdir().expect("tempdir");

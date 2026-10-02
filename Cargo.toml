@@ -25,6 +25,7 @@ tokio-util = { version = "=0.7.19", features = ["io", "io-util"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 chrono = { version = "=0.4.45", features = ["clock", "serde"] }
+chrono-tz = "=0.10.4"
 croner = "=4.0.0"
 
 # Storage. `default-features = false` plus explicit features keeps the TLS

@@ -1,6 +1,6 @@
 //! Shared helpers for the container-backed integration tests.
 //!
-//! Included with `#[path = "support/mod.rs"] mod support;` from `s3_minio.rs`
+//! Included with `#[path = "support/mod.rs"] mod support;` from `s3_test.rs`
 //! and `sftp.rs`.
 
 use testcontainers::bollard::models::HostConfig;

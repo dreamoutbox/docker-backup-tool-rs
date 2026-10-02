@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod job;
 pub mod lock;
 pub mod retention;
+pub mod scheduler;
 pub mod signal;
 pub mod storage;
 

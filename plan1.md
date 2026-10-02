@@ -264,7 +264,7 @@ Acceptance criteria:
 
 ---
 
-## Phase 4: Scheduler, daemon, image polish
+## Phase 4: Scheduler, daemon, image polish (DONE)
 
 Goal: `dvb run` is production-usable.
 
@@ -294,8 +294,7 @@ Tasks:
 1. `storage.rs`: `dropbox` with `client_id`, `client_secret`, `refresh_token` (OpenDAL refreshes access tokens). Support `*_FILE` for all three.
 2. **Before coding the upload path**, check whether the pinned OpenDAL version supports large uploads (>150 MB) for Dropbox. If it does not, implement `stage = "local"` for that backend: write the archive to a temp file, restart containers, then upload using whatever chunked mechanism is supported. If still unsupported, document the size limit and fail early with a clear error when the archive exceeds it.
 3. Add generic `stage = "stream" | "local"` job option (default `stream`). `local` writes a temp file under `DVB_TMP_DIR`, restores containers immediately after archiving, then uploads, which reduces container downtime for slow remotes. Delete the temp file in all paths.
-4. `dvb auth dropbox` helper: guides the user through the OAuth code flow once and prints a refresh token. (Optional; docs-only if time is short.)
-5. Retention and `list` must work on Dropbox with filename-based timestamps.
+4. Retention and `list` must work on Dropbox with filename-based timestamps.
 
 Acceptance criteria:
 

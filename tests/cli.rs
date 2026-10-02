@@ -38,13 +38,8 @@ fn global_flags_accept_the_documented_env_vars() {
 }
 
 #[test]
-fn not_yet_implemented_subcommands_exit_with_failure() {
-    dvb()
-        .arg("run")
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicates::str::contains("not implemented yet"));
+fn run_without_a_config_file_fails() {
+    dvb().arg("run").assert().failure().code(1);
 }
 
 #[test]

@@ -10,7 +10,7 @@
 mod cli;
 
 use dvb::config::{self, Config, JobConfig};
-use dvb::{docker, error, job, retention, storage};
+use dvb::{docker, error, job, retention, scheduler, storage};
 
 use std::io::IsTerminal as _;
 use std::path::Path;
@@ -64,7 +64,7 @@ fn main() -> ExitCode {
 /// Run the requested subcommand. Each arm returns the process exit code.
 async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     let outcome: error::Result<u8> = match &cli.command {
-        Command::Run => Err(Error::NotImplemented("run")),
+        Command::Run => run(&cli.global).await,
         Command::Backup { job } => backup(&cli.global, job).await,
         Command::Prune { job, dry_run } => prune(&cli.global, job, *dry_run).await,
         Command::List { job } => list(&cli.global, job).await,
@@ -74,6 +74,12 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
     outcome
         .map_err(anyhow::Error::from)
         .with_context(|| describe(&cli.command))
+}
+
+/// `dvb run`: start the scheduler daemon and execute jobs on their cron schedules.
+async fn run(global: &GlobalArgs) -> error::Result<u8> {
+    let config = Config::load(&global.config)?;
+    scheduler::run(config).await
 }
 
 /// `dvb backup <job>`: one archive, streamed to storage, right now.
@@ -377,14 +383,14 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_implemented_commands_fail() {
+    fn run_without_config_fails() {
         let cli = Cli::parse_from(["dvb", "run"]);
         let err = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime")
             .block_on(dispatch(&cli))
             .unwrap_err();
-        assert!(format!("{err:#}").contains("not implemented yet"));
+        assert!(format!("{err:#}").contains("no [[job]] defined"));
     }
 
     #[test]

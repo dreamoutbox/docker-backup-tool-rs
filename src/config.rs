@@ -35,6 +35,10 @@ pub struct Config {
     #[serde(default)]
     pub docker: DockerConfig,
 
+    /// Seconds to wait for running jobs to finish when shutting down before cancelling them.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+
     #[serde(rename = "job", default)]
     pub jobs: Vec<JobConfig>,
 }
@@ -102,9 +106,15 @@ pub struct JobConfig {
     pub post: Vec<HookConfig>,
 
     /// Run this job once at daemon start, before its first scheduled run.
-    #[allow(dead_code)] // read by scheduler.rs in phase 4
     #[serde(default)]
     pub run_on_start: bool,
+}
+
+/// Default grace period (in seconds) to wait for running jobs to finish on shutdown.
+pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 60;
+
+const fn default_shutdown_grace_secs() -> u64 {
+    DEFAULT_SHUTDOWN_GRACE_SECS
 }
 
 const fn default_retention_days() -> u32 {
