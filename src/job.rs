@@ -52,6 +52,8 @@ pub struct BackupOutcome {
     pub post: Result<()>,
     /// What retention did afterwards, or why it failed.
     pub prune: Result<crate::retention::PrunePlan>,
+    /// Result of writing the integrity sidecar checksum.
+    pub sidecar: Result<()>,
 }
 
 impl BackupOutcome {
@@ -59,12 +61,12 @@ impl BackupOutcome {
     ///
     /// * `0` — everything succeeded
     /// * `1` — a container was left stopped
-    /// * `2` — the archive is stored, but a post hook or pruning failed
+    /// * `2` — the archive is stored, but a post hook, pruning, or sidecar write failed
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         if self.restore.is_err() {
             crate::error::EXIT_FAILURE
-        } else if self.post.is_err() || self.prune.is_err() {
+        } else if self.post.is_err() || self.prune.is_err() || self.sidecar.is_err() {
             crate::error::EXIT_PARTIAL
         } else {
             crate::error::EXIT_SUCCESS
@@ -228,7 +230,13 @@ async fn run_backup_locked(
     //    a post hook may target the very containers that were stopped.
     let restore = restore(&mut guard).await;
 
-    // 5. Post hooks, filtered by run_on.
+    // 5. Write integrity sidecar checksum (Phase 9).
+    let sidecar = match &uploaded {
+        Ok((_, _, checksum)) => write_sidecar(op, backend, &remote, &object, checksum).await,
+        Err(_) => Ok(()),
+    };
+
+    // 6. Post hooks, filtered by run_on.
     let (hook_status, error) = match &uploaded {
         Ok(_) => (Status::Success, String::new()),
         Err(err) => (Status::Failure, err.to_string()),
@@ -244,7 +252,7 @@ async fn run_backup_locked(
         tracing::error!(error = %err, "a post hook failed after the backup");
     }
 
-    let (meta, archive_stats) = match uploaded {
+    let (meta, archive_stats, _) = match uploaded {
         Ok(written) => written,
         Err(err) => {
             tracing::error!(object = %remote, error = %err, "backup failed");
@@ -260,7 +268,7 @@ async fn run_backup_locked(
         "backup uploaded"
     );
 
-    // 6. Prune only now that the new backup is safely stored, so a failed
+    // 7. Prune only now that the new backup is safely stored, so a failed
     //    upload can never delete the backup it would have replaced.
     let prune = prune_after_upload(op, job, now).await;
 
@@ -273,6 +281,7 @@ async fn run_backup_locked(
         restore,
         post,
         prune,
+        sidecar,
     })
 }
 
@@ -343,6 +352,35 @@ async fn restore(guard: &mut Option<StopGuard>) -> Result<()> {
     }
 }
 
+async fn write_sidecar(
+    op: &Operator,
+    backend: &'static str,
+    remote: &str,
+    object: &str,
+    checksum: &str,
+) -> Result<()> {
+    let sidecar_remote = crate::integrity::sidecar_path(remote);
+    let sidecar_content = crate::integrity::format_sidecar(checksum, object);
+    match storage::write_bytes(op, backend, &sidecar_remote, sidecar_content.into_bytes()).await {
+        Ok(_) => {
+            tracing::info!(
+                sidecar = %sidecar_remote,
+                checksum = %checksum,
+                "integrity sidecar checksum written"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                sidecar = %sidecar_remote,
+                "failed to write integrity sidecar checksum; backup marked partial"
+            );
+            Err(err)
+        }
+    }
+}
+
 /// Stream the archive into `remote`, cleaning up on failure.
 ///
 /// A shutdown signal abandons the stream the same way an error does: the
@@ -355,15 +393,16 @@ async fn upload(
     sources: Vec<Source>,
     options: ArchiveOptions,
     shutdown: &Shutdown,
-) -> Result<(opendal::Metadata, ArchiveStats)> {
+) -> Result<(opendal::Metadata, ArchiveStats, String)> {
     let writer = storage::new_writer(op, backend, remote).await?;
-    let mut sink = WriterSink::new(writer, backend);
+    let sink = WriterSink::new(writer, backend);
+    let mut hashing_sink = crate::integrity::HashingSink::new(sink);
 
     // Scoped so the stream's borrow of `sink` ends before `abort` takes it.
     // `biased` puts the shutdown first: once a signal has fired it wins over
     // any chunk the archiver happens to be ready with.
     let streamed = {
-        let stream = archive::stream_to(sources, &mut sink, options);
+        let stream = archive::stream_to(sources, &mut hashing_sink, options);
         tokio::pin!(stream);
         tokio::select! {
             biased;
@@ -371,6 +410,8 @@ async fn upload(
             result = &mut stream => Some(result),
         }
     };
+
+    let (sink, checksum) = hashing_sink.finish_hex();
 
     let stats = match streamed {
         Some(Ok(stats)) => stats,
@@ -399,7 +440,7 @@ async fn upload(
         }
     };
 
-    Ok((meta, stats))
+    Ok((meta, stats, checksum))
 }
 
 #[cfg(test)]
@@ -507,8 +548,10 @@ mod tests {
         let listed = storage::list_prefix(&op, "fs", "backups")
             .await
             .expect("list");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].path, outcome.object);
+        assert_eq!(listed.len(), 2);
+        let paths: Vec<_> = listed.into_iter().map(|o| o.path).collect();
+        assert!(paths.contains(&outcome.object));
+        assert!(paths.contains(&format!("{}.sha256", outcome.object)));
         drop(lock);
     }
 

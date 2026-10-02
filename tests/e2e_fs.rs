@@ -95,6 +95,14 @@ min_keep = 3
 
     /// Stored objects under `backups`, as `(name, size)`.
     fn stored(&self) -> BTreeMap<String, u64> {
+        let mut files = list_files(&self.remote.join("backups"));
+        files.retain(|name, _| !name.ends_with(".sha256"));
+        files
+    }
+
+    /// All stored files under `backups`, including sidecars.
+    #[allow(dead_code)]
+    fn stored_all(&self) -> BTreeMap<String, u64> {
         list_files(&self.remote.join("backups"))
     }
 
@@ -104,6 +112,7 @@ min_keep = 3
             .expect("read remote dir")
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
+            .filter(|p| !p.to_string_lossy().ends_with(".sha256"))
             .collect();
         assert!(
             found.len() <= 1,
@@ -1044,4 +1053,149 @@ fn example_pg_restore_script_execution_and_help() {
     assert!(!empty_dir_res.status.success());
     let stderr = String::from_utf8_lossy(&empty_dir_res.stderr);
     assert!(stderr.contains("No dump file"));
+}
+
+#[test]
+fn backup_creates_sha256_sidecar_compatible_with_sha256sum() {
+    let f = Fixture::new();
+    build_source_tree(&f.source);
+    let output = f.backup();
+    assert!(output.status.success());
+
+    let archive = f.only_object().expect("archive exists");
+    let sidecar_path = PathBuf::from(format!("{}.sha256", archive.display()));
+    assert!(
+        sidecar_path.exists(),
+        "sidecar must exist at {sidecar_path:?}"
+    );
+
+    let sidecar_file_name = sidecar_path.file_name().expect("filename");
+    let check = std::process::Command::new("sha256sum")
+        .arg("-c")
+        .arg(sidecar_file_name)
+        .current_dir(f.remote.join("backups"))
+        .output()
+        .expect("run sha256sum -c");
+    assert!(
+        check.status.success(),
+        "sha256sum check failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn restore_fails_on_checksum_mismatch_and_preserves_nothing_and_does_not_run_script() {
+    let f = Fixture::new();
+    build_source_tree(&f.source);
+    assert!(f.backup().status.success());
+
+    let archive = f.only_object().expect("archive exists");
+    let mut bytes = std::fs::read(&archive).expect("read archive");
+    let len = bytes.len();
+    bytes[len / 2] ^= 0xFF;
+    std::fs::write(&archive, bytes).expect("write corrupted archive");
+
+    let marker_path = f.source.parent().unwrap().join("marker.txt");
+    let script_path = f.source.parent().unwrap().join("test_script.sh");
+    std::fs::write(
+        &script_path,
+        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker_path.display()),
+    )
+    .expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
+
+    let target_dir = f.source.parent().unwrap().join("restore_target");
+    let res = f.restore(&[
+        "--to",
+        &target_dir.display().to_string(),
+        "--script",
+        &script_path.display().to_string(),
+    ]);
+
+    assert_eq!(
+        res.status.code(),
+        Some(1),
+        "restore must exit with code 1 on corruption"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("checksum mismatch")
+            || stderr.contains("corrupted")
+            || stderr.contains("archive error"),
+        "expected corruption / checksum mismatch error: {stderr}"
+    );
+
+    assert!(
+        !target_dir.exists(),
+        "extracted dir must not remain on checksum failure"
+    );
+    let staging = PathBuf::from(format!("{}.dvb-partial", target_dir.display()));
+    assert!(
+        !staging.exists(),
+        "staging dir must be cleaned up on failure"
+    );
+    assert!(
+        !marker_path.exists(),
+        "script must never run before checksum verification completes"
+    );
+}
+
+#[test]
+fn restore_succeeds_for_backup_without_sidecar_with_warning() {
+    let f = Fixture::new();
+    build_source_tree(&f.source);
+    assert!(f.backup().status.success());
+
+    let archive = f.only_object().expect("archive exists");
+    let sidecar_path = PathBuf::from(format!("{}.sha256", archive.display()));
+    assert!(sidecar_path.exists());
+    std::fs::remove_file(&sidecar_path).expect("remove sidecar");
+
+    let target_dir = f.source.parent().unwrap().join("restore_legacy_target");
+    let res = f.restore(&["--to", &target_dir.display().to_string()]);
+    assert!(
+        res.status.success(),
+        "restore without sidecar must succeed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("sidecar checksum not found"),
+        "expected warning in logs: {stderr}"
+    );
+    assert!(target_dir.join("pgdata/a.txt").exists(), "files extracted");
+}
+
+#[test]
+fn no_verify_restores_corrupted_archive_without_hashing() {
+    let f = Fixture::with_template("db-%Y%m%dT%H%M%SZ.tar", "none");
+    build_source_tree(&f.source);
+    assert!(f.backup().status.success());
+
+    let archive = f.only_object().expect("archive exists");
+    let sidecar_path = PathBuf::from(format!("{}.sha256", archive.display()));
+    assert!(sidecar_path.exists());
+
+    let mut bytes = std::fs::read(&archive).expect("read archive");
+    let pos = bytes
+        .windows(5)
+        .position(|w| w == b"hello")
+        .expect("found hello in tar");
+    bytes[pos] = b'X';
+    std::fs::write(&archive, bytes).expect("write corrupted archive");
+
+    let target_dir = f.source.parent().unwrap().join("no_verify_target");
+    let res = f.restore(&["--to", &target_dir.display().to_string(), "--no-verify"]);
+    assert!(
+        res.status.success(),
+        "restore with --no-verify must succeed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(target_dir.exists(), "extracted dir must exist");
 }

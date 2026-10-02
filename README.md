@@ -22,8 +22,15 @@ each phase.
 | `dvb check` | Validate the config and round-trip each backend |
 | `dvb crontext "<expr>"` | Parse natural schedule and show next 5 fire times |
 
-Exit codes: `0` success, `1` failure, `2` partial — the archive reached storage
-but a post hook or the retention pass failed, `3` restore extracted OK but the script failed.
+### Exit codes
+
+| Exit Code | Name | Meaning |
+|---|---|---|
+| `0` | Success | Operation completed successfully |
+| `1` | Failure | Backup, restore, prune, or check failed (pre-hooks failed, extraction failed, checksum mismatch, container start failure) |
+| `2` | Partial | Backup archive reached storage successfully, but post-hooks, sidecar checksum write, or retention prune failed |
+| `3` | Script Failure | Restore archive was verified and extracted successfully, but the restore hook script failed or timed out |
+
 A failed run never leaves a partial object behind, so a truncated archive cannot be mistaken for a good backup.
 
 ## Quick Start
@@ -93,6 +100,24 @@ Jobs are scheduled according to the `TZ` environment variable (default `UTC`), e
 ### Schedules: `cron` or `crontext`
 
 Each job must define **exactly one** of `cron` or `crontext`. Setting both or neither is an error.
+
+| Natural expression | Equivalent 5-field cron |
+|---|---|
+| `every minute` | `* * * * *` |
+| `every 15 minutes` | `*/15 * * * *` |
+| `every hour` | `0 * * * *` |
+| `every 12 hours` | `0 */12 * * *` |
+| `every day` | `0 0 * * *` |
+| `every 1 day` | `0 0 * * *` |
+| `every day at 03:30` | `30 3 * * *` |
+| `every 12:00` | `0 12 * * *` |
+| `every monday` | `0 0 * * 1` |
+| `every friday at 18:00` | `0 18 * * 5` |
+| `every mon, wed and fri at 06:30` | `30 6 * * 1,3,5` |
+| `every weekday at 09:00` | `0 9 * * 1-5` |
+| `every weekend at 10:00` | `0 10 * * 6,0` |
+| `every month` | `0 0 1 * *` |
+| `every month on the 1st at 03:00` | `0 3 1 * *` |
 
 ```crontext
 every minute
@@ -279,6 +304,77 @@ that do not match the job's filename pattern are never deleted.
 
 Pruning runs only after a successful upload, and a delete that fails is
 reported rather than skipped.
+
+## Restore
+
+```sh
+dvb restore <job> [options] [-- <script args>...]
+```
+
+Options:
+
+| Flag | Purpose |
+|---|---|
+| `--from <object>` | Name or path of remote archive to restore (default: newest backup) |
+| `--to <dir>` | Directory to extract files into (overrides `job.restore.dir`) |
+| `--script <path>` | Path to post-extraction hook script (overrides `job.restore.script`) |
+| `--script-timeout-secs <secs>` | Timeout in seconds for script execution (default: 300) |
+| `--cleanup` | Delete extracted staging directory after script succeeds |
+| `--force` | Overwrite existing files if target directory is not empty |
+| `--stop-containers` | Stop configured containers during restore, restarting afterwards |
+| `--dry-run` | Print restore plan without downloading, extracting, or executing scripts |
+| `--no-verify` | Skip sidecar SHA-256 checksum verification |
+
+Example configuration in `config.toml`:
+
+```toml
+[[job]]
+name = "db"
+# ...
+
+  [job.restore]
+  dir = "/backup/restore"
+  script = "/scripts/pg_restore.sh"
+  script_timeout_secs = 600
+  cleanup = true
+```
+
+### Safety and stdout contract
+
+- **Volume isolation:** `dvb restore` never writes to original volume locations directly. It only extracts archives safely into a target directory. Moving data into active volumes or importing dumps is the sole responsibility of the restore script.
+- **Atomic extraction:** Files are extracted into a temporary sibling staging directory (`.dvb-staging-*`). If extraction or verification fails, the staging directory is completely deleted, preventing corrupted or half-extracted files from remaining.
+- **stdout contract:** On success, `dvb restore` emits exactly one line to stdout: the absolute path of the restored directory. All logs, progress messages, and script output are directed to stderr. This enables shell composition:
+  ```sh
+  RESTORE_DIR=$(dvb restore db)
+  ```
+
+### Integrity verification
+
+- When creating backups, `dvb` computes a SHA-256 digest over the uploaded compressed archive and stores `<archive-name>.sha256` sidecar in standard `sha256sum -c` format (`<hex>  <filename>\n`).
+- During restore, the compressed stream is hashed in-flight. If a sidecar exists, the calculated hash is compared before proceeding.
+- If checksum verification fails:
+  1. The process aborts immediately with exit code `1`.
+  2. The extracted directory is removed.
+  3. The restore script is **never** executed.
+- Backups created without a sidecar (e.g. legacy archives) produce a warning and continue extraction.
+- `--no-verify` skips checksum verification and skips fetching the sidecar.
+
+### Container script execution caveat
+
+Restore hook scripts execute **inside the dvb container**, NOT on the host machine or inside target application containers.
+
+If the restore script runs database commands (such as `pg_restore` or `mysql`):
+1. The necessary client tools must be installed inside the `dvb` container image; OR
+2. The script must execute commands against the target database container via `docker exec` (which requires `/var/run/docker.sock` to be mounted).
+
+The restore script is supplied with the following environment variables:
+
+| Variable | Value |
+|---|---|
+| `DVB_RESTORE_DIR` | Absolute path of the extracted files |
+| `DVB_TARGET_DIR` | Requested target directory |
+| `DVB_JOB` | Job name |
+| `DVB_ARCHIVE` | Name of the restored archive object |
 
 ## Development
 

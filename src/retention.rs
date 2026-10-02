@@ -62,22 +62,46 @@ impl PrunePlan {
     }
 }
 
-/// List this job's backups under its prefix, newest first.
-///
-/// Objects whose name does not match the job's filename pattern are reported as
-/// ignored rather than returned, so callers cannot accidentally act on them.
+/// A stored sidecar checksum file with its parsed timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sidecar {
+    /// Object path relative to the backend root, including the job prefix.
+    pub path: String,
+    /// Archive object path this sidecar belongs to.
+    pub archive_path: String,
+    /// Timestamp encoded in the archive name.
+    pub timestamp: DateTime<Utc>,
+}
+
+/// List this job's archives, sidecars, and ignored objects under its prefix.
 ///
 /// # Errors
 ///
 /// [`Error::Storage`] when the prefix cannot be listed.
-pub async fn list_backups(op: &Operator, job: &JobConfig) -> Result<(Vec<Backup>, Vec<String>)> {
+pub async fn list_storage(
+    op: &Operator,
+    job: &JobConfig,
+) -> Result<(Vec<Backup>, Vec<Sidecar>, Vec<String>)> {
     let backend = job.storage.kind();
     let prefix = job.storage.prefix().trim_matches('/');
     let listed = storage::list_prefix(op, backend, prefix).await?;
 
     let mut backups = Vec::new();
+    let mut sidecars = Vec::new();
     let mut ignored = Vec::new();
     for object in listed {
+        if let Some(archive_path) = object.path.strip_suffix(".sha256")
+            && let Some(timestamp) = job.parse_object_name(archive_path)
+        {
+            let archive_path = archive_path.to_owned();
+            sidecars.push(Sidecar {
+                path: object.path,
+                archive_path,
+                timestamp,
+            });
+            continue;
+        }
+
         match job.parse_object_name(&object.path) {
             Some(timestamp) => backups.push(Backup {
                 path: object.path,
@@ -94,8 +118,27 @@ pub async fn list_backups(op: &Operator, job: &JobConfig) -> Result<(Vec<Backup>
             .cmp(&a.timestamp)
             .then_with(|| a.path.cmp(&b.path))
     });
+    sidecars.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     ignored.sort();
 
+    Ok((backups, sidecars, ignored))
+}
+
+/// List this job's backups under its prefix, newest first.
+///
+/// Objects whose name does not match the job's filename pattern are reported as
+/// ignored rather than returned, so callers cannot accidentally act on them.
+/// `*.sha256` sidecars belonging to this job are excluded from both lists.
+///
+/// # Errors
+///
+/// [`Error::Storage`] when the prefix cannot be listed.
+pub async fn list_backups(op: &Operator, job: &JobConfig) -> Result<(Vec<Backup>, Vec<String>)> {
+    let (backups, _sidecars, ignored) = list_storage(op, job).await?;
     Ok((backups, ignored))
 }
 
@@ -122,7 +165,7 @@ pub fn plan_prune(job: &JobConfig, backups: &[Backup], now: DateTime<Utc>) -> Pr
     plan
 }
 
-/// List, plan and (unless `dry_run`) delete expired backups.
+/// List, plan and (unless `dry_run`) delete expired backups and associated sidecars.
 ///
 /// # Errors
 ///
@@ -135,7 +178,7 @@ pub async fn prune(
     dry_run: bool,
 ) -> Result<PrunePlan> {
     let backend = job.storage.kind();
-    let (backups, ignored) = list_backups(op, job).await?;
+    let (backups, sidecars, ignored) = list_storage(op, job).await?;
     let mut plan = plan_prune(job, &backups, now);
 
     for path in &ignored {
@@ -143,9 +186,30 @@ pub async fn prune(
     }
     plan.ignored = ignored;
 
+    let expired_archive_paths: std::collections::BTreeSet<&str> =
+        plan.expired.iter().map(|b| b.path.as_str()).collect();
+    let existing_archive_paths: std::collections::BTreeSet<&str> =
+        backups.iter().map(|b| b.path.as_str()).collect();
+
+    let cutoff = now - chrono::Duration::days(i64::from(job.retention_days));
+    let mut sidecars_to_delete = Vec::new();
+
+    for sidecar in &sidecars {
+        let is_expired_archive_sidecar =
+            expired_archive_paths.contains(sidecar.archive_path.as_str());
+        let is_expired_orphan = !existing_archive_paths.contains(sidecar.archive_path.as_str())
+            && sidecar.timestamp < cutoff;
+        if is_expired_archive_sidecar || is_expired_orphan {
+            sidecars_to_delete.push(&sidecar.path);
+        }
+    }
+
     if dry_run {
         for backup in &plan.expired {
             tracing::info!(path = %backup.path, age_days = age_days(backup, now), "would delete");
+        }
+        for path in &sidecars_to_delete {
+            tracing::info!(path = %path, "would delete sidecar");
         }
         return Ok(plan);
     }
@@ -160,6 +224,11 @@ pub async fn prune(
         // A delete that fails must not be silently skipped: the object stays and
         // the next run tries again.
         storage::delete_object(op, backend, &backup.path).await?;
+    }
+
+    for path in sidecars_to_delete {
+        tracing::info!(path = %path, "deleting expired sidecar");
+        storage::delete_object(op, backend, path).await?;
     }
 
     Ok(plan)
@@ -505,5 +574,69 @@ mod tests {
                 .delete_count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn list_backups_hides_sidecars_and_leaves_them_out_of_ignored() {
+        let op = memory_operator();
+        let job = job(7, 1);
+        put(&op, "db/db-20240309T000000Z.tar.zst", b"archive").await;
+        put(&op, "db/db-20240309T000000Z.tar.zst.sha256", b"checksum").await;
+        put(&op, "db/unrelated.txt", b"unrelated").await;
+
+        let (backups, ignored) = list_backups(&op, &job).await.expect("list");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].path, "db/db-20240309T000000Z.tar.zst");
+        assert_eq!(ignored, vec!["db/unrelated.txt".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_sidecar_together_with_archive() {
+        let op = memory_operator();
+        let job = job(7, 1);
+        put(&op, "db/db-20240101T000000Z.tar.zst", b"old_archive").await;
+        put(&op, "db/db-20240101T000000Z.tar.zst.sha256", b"old_sidecar").await;
+        put(&op, "db/db-20240309T000000Z.tar.zst", b"new_archive").await;
+        put(&op, "db/db-20240309T000000Z.tar.zst.sha256", b"new_sidecar").await;
+
+        let now = at(2024, 3, 10, 0, 0, 0);
+        let plan = prune(&op, &job, now, false).await.expect("prune");
+        assert_eq!(plan.delete_count(), 1);
+
+        let remaining = keys(&op).await;
+        assert_eq!(
+            remaining,
+            vec![
+                "db/db-20240309T000000Z.tar.zst".to_owned(),
+                "db/db-20240309T000000Z.tar.zst.sha256".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_expired_orphan_sidecar_and_keeps_fresh_one() {
+        let op = memory_operator();
+        let job = job(7, 1);
+        // Orphan old sidecar (archive deleted or missing)
+        put(&op, "db/db-20240101T000000Z.tar.zst.sha256", b"orphan_old").await;
+        // Orphan fresh sidecar (less than 7 days old)
+        put(
+            &op,
+            "db/db-20240308T000000Z.tar.zst.sha256",
+            b"orphan_fresh",
+        )
+        .await;
+        // Valid fresh archive + sidecar
+        put(&op, "db/db-20240309T000000Z.tar.zst", b"archive").await;
+        put(&op, "db/db-20240309T000000Z.tar.zst.sha256", b"sidecar").await;
+
+        let now = at(2024, 3, 10, 0, 0, 0);
+        prune(&op, &job, now, false).await.expect("prune");
+
+        let remaining = keys(&op).await;
+        assert!(!remaining.contains(&"db/db-20240101T000000Z.tar.zst.sha256".to_owned()));
+        assert!(remaining.contains(&"db/db-20240308T000000Z.tar.zst.sha256".to_owned()));
+        assert!(remaining.contains(&"db/db-20240309T000000Z.tar.zst".to_owned()));
+        assert!(remaining.contains(&"db/db-20240309T000000Z.tar.zst.sha256".to_owned()));
     }
 }

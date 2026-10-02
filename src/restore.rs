@@ -829,6 +829,122 @@ pub async fn run_restore(
     })
 }
 
+async fn fetch_sidecar_checksum(
+    op: &Operator,
+    backend: &'static str,
+    backup_path: &str,
+    no_verify: bool,
+) -> Result<Option<String>> {
+    if no_verify {
+        tracing::warn!("--no-verify specified; skipping integrity checksum verification");
+        return Ok(None);
+    }
+
+    let sidecar_path = crate::integrity::sidecar_path(backup_path);
+    match op.read(&sidecar_path).await {
+        Ok(bytes) => {
+            let bytes_vec = bytes.to_vec();
+            let text = String::from_utf8_lossy(&bytes_vec);
+            let (hex, _) = crate::integrity::parse_sidecar(&text).ok_or_else(|| {
+                Error::Restore(format!("invalid sidecar checksum in `{sidecar_path}`"))
+            })?;
+            Ok(Some(hex))
+        }
+        Err(err) if err.kind() == opendal::ErrorKind::NotFound => {
+            tracing::warn!(
+                sidecar = %sidecar_path,
+                "sidecar checksum not found; skipping verification for older backup"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(Error::Storage {
+            backend,
+            source: err,
+        }),
+    }
+}
+
+struct UnpackParams {
+    force: bool,
+    preserve_owner: bool,
+    max_extracted_bytes: Option<u64>,
+    configured_compression: Compression,
+    extract_dir: PathBuf,
+    backup_path: String,
+    expected_checksum: Option<String>,
+}
+
+fn unpack_and_verify<R: std::io::Read + Send>(
+    mut sync_reader: R,
+    params: UnpackParams,
+) -> Result<()> {
+    let mut magic_buf = [0u8; 4];
+    let mut magic_read = 0;
+    while magic_read < 4 {
+        match sync_reader.read(&mut magic_buf[magic_read..]) {
+            Ok(0) => break,
+            Ok(n) => magic_read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::archive_other(e)),
+        }
+    }
+
+    let detected = detect_compression(&magic_buf[..magic_read]);
+    if detected != params.configured_compression {
+        tracing::warn!(
+            detected = ?detected,
+            configured = ?params.configured_compression,
+            "detected archive compression differs from job configuration; trusting magic bytes"
+        );
+    }
+
+    let chained = std::io::Cursor::new(magic_buf[..magic_read].to_vec()).chain(sync_reader);
+    let mut hashing_reader = crate::integrity::HashingReader::new(chained);
+
+    let decompressed: Box<dyn std::io::Read + Send + '_> = match detected {
+        Compression::Zstd => Box::new(
+            zstd::stream::read::Decoder::new(&mut hashing_reader).map_err(Error::archive_other)?,
+        ),
+        Compression::Gzip => Box::new(flate2::read::GzDecoder::new(&mut hashing_reader)),
+        Compression::None => Box::new(&mut hashing_reader),
+    };
+
+    extract_archive(
+        decompressed,
+        &params.extract_dir,
+        params.force,
+        params.preserve_owner,
+        params.max_extracted_bytes,
+    )?;
+
+    if let Some(expected) = params.expected_checksum {
+        hashing_reader
+            .drain_to_end()
+            .map_err(Error::archive_other)?;
+        let computed = hashing_reader.finish_hex();
+        if computed != expected {
+            tracing::error!(
+                path = %params.backup_path,
+                expected = %expected,
+                computed = %computed,
+                "integrity verification failed: SHA-256 checksum mismatch"
+            );
+            return Err(Error::ChecksumMismatch {
+                path: params.backup_path,
+                expected,
+                computed,
+            });
+        }
+        tracing::info!(
+            path = %params.backup_path,
+            checksum = %computed,
+            "integrity checksum verified successfully"
+        );
+    }
+
+    Ok(())
+}
+
 async fn download_and_extract(
     op: &Operator,
     job: &JobConfig,
@@ -837,6 +953,9 @@ async fn download_and_extract(
     options: &RestoreOptions,
     shutdown: &Shutdown,
 ) -> Result<()> {
+    let expected_checksum =
+        fetch_sidecar_checksum(op, job.storage.kind(), backup_path, options.no_verify).await?;
+
     let reader = op
         .reader(backup_path)
         .await
@@ -856,51 +975,19 @@ async fn download_and_extract(
 
     let async_reader = tokio_util::io::StreamReader::new(byte_stream);
 
-    let force = options.force;
-    let preserve_owner = options.preserve_owner;
-    let max_extracted_bytes = options.max_extracted_bytes;
-    let configured_compression = job.compression;
-    let extract_dir = extract_path.to_path_buf();
+    let params = UnpackParams {
+        force: options.force,
+        preserve_owner: options.preserve_owner,
+        max_extracted_bytes: options.max_extracted_bytes,
+        configured_compression: job.compression,
+        extract_dir: extract_path.to_path_buf(),
+        backup_path: backup_path.to_owned(),
+        expected_checksum,
+    };
 
-    let mut task = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut sync_reader = tokio_util::io::SyncIoBridge::new(async_reader);
-
-        let mut magic_buf = [0u8; 4];
-        let mut magic_read = 0;
-        while magic_read < 4 {
-            match sync_reader.read(&mut magic_buf[magic_read..]) {
-                Ok(0) => break,
-                Ok(n) => magic_read += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Error::archive_other(e)),
-            }
-        }
-
-        let detected = detect_compression(&magic_buf[..magic_read]);
-        if detected != configured_compression {
-            tracing::warn!(
-                detected = ?detected,
-                configured = ?configured_compression,
-                "detected archive compression differs from job configuration; trusting magic bytes"
-            );
-        }
-
-        let chained = std::io::Cursor::new(magic_buf[..magic_read].to_vec()).chain(sync_reader);
-        let decompressed: Box<dyn std::io::Read + Send> = match detected {
-            Compression::Zstd => {
-                Box::new(zstd::stream::read::Decoder::new(chained).map_err(Error::archive_other)?)
-            }
-            Compression::Gzip => Box::new(flate2::read::GzDecoder::new(chained)),
-            Compression::None => Box::new(chained),
-        };
-
-        extract_archive(
-            decompressed,
-            &extract_dir,
-            force,
-            preserve_owner,
-            max_extracted_bytes,
-        )
+    let mut task = tokio::task::spawn_blocking(move || {
+        let sync_reader = tokio_util::io::SyncIoBridge::new(async_reader);
+        unpack_and_verify(sync_reader, params)
     });
 
     tokio::select! {

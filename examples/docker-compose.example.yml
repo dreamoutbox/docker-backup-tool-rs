@@ -81,8 +81,12 @@ services:
       #   CONTAINERS=1
       #   POST=1
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Restore script hook (optional)
-      - ./pg_restore.sh:/scripts/pg_restore.sh:ro
+      # Restore scripts directory (optional).
+      # NOTE: Restore scripts execute inside this backup container, NOT on the host or
+      # inside target database containers. Database client tools (like pg_restore) must
+      # either be installed in the backup container image, or the script must invoke
+      # `docker exec` against the target container (via the Docker socket).
+      - ./scripts:/scripts:ro
     environment:
       - TZ=UTC
       - DVB_LOG=dvb=info

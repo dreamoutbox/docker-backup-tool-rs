@@ -36,6 +36,14 @@ pub enum Error {
     #[error("restore failed: {0}")]
     Restore(String),
 
+    /// Checksum verification failed for an archive.
+    #[error("checksum mismatch for `{path}`: expected {expected}, computed {computed}")]
+    ChecksumMismatch {
+        path: String,
+        expected: String,
+        computed: String,
+    },
+
     /// The configuration could not be loaded or is invalid.
     #[error(transparent)]
     Config(#[from] ConfigError),

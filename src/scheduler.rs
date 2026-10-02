@@ -727,8 +727,8 @@ mod tests {
         let backup_dir = tmp.path().join("backups");
         let job1_files = std::fs::read_dir(backup_dir.join("job1")).expect("read job1 dir");
         let job2_files = std::fs::read_dir(backup_dir.join("job2")).expect("read job2 dir");
-        assert_eq!(job1_files.count(), 1);
-        assert_eq!(job2_files.count(), 1);
+        assert_eq!(job1_files.count(), 2);
+        assert_eq!(job2_files.count(), 2);
     }
 
     #[tokio::test]

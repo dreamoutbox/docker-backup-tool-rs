@@ -305,14 +305,24 @@ min_keep = 1
     let listed = dvb::storage::list_prefix(&op, "sftp", UPLOAD_DIR)
         .await
         .expect("list over sftp");
-    assert_eq!(listed.len(), 1, "unexpected objects: {listed:?}");
-    assert!(listed[0].size > 0, "empty object: {listed:?}");
+    assert_eq!(listed.len(), 2, "unexpected objects: {listed:?}");
+    let archive = listed
+        .iter()
+        .find(|o| !o.path.ends_with(".sha256"))
+        .expect("archive object present");
+    assert!(archive.size > 0, "empty object: {listed:?}");
     let ext = dvb::config::Compression::Zstd
         .extension()
         .expect("zstd has an extension");
     assert!(
-        listed[0].path.ends_with(&format!(".{ext}")),
+        archive.path.ends_with(&format!(".{ext}")),
         "{}",
-        listed[0].path
+        archive.path
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|o| o.path == format!("{}.sha256", archive.path)),
+        "sidecar missing in {listed:?}"
     );
 }

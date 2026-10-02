@@ -201,12 +201,17 @@ async fn uploads_an_archive_and_lists_it() {
         .into_iter()
         .map(|entry| entry.path().to_owned())
         .collect();
-    assert_eq!(keys.len(), 1, "unexpected objects: {keys:?}");
-    assert!(keys[0].starts_with("db/db-"), "{}", keys[0]);
+    assert_eq!(keys.len(), 2, "unexpected objects: {keys:?}");
+    let archive_key = keys
+        .iter()
+        .find(|k| !k.ends_with(".sha256"))
+        .expect("archive object present");
+    assert!(archive_key.starts_with("db/db-"), "{}", archive_key);
     let ext = dvb::config::Compression::Zstd
         .extension()
         .expect("zstd has an extension");
-    assert!(keys[0].ends_with(&format!(".{ext}")), "{}", keys[0]);
+    assert!(archive_key.ends_with(&format!(".{ext}")), "{}", archive_key);
+    assert!(keys.contains(&format!("{archive_key}.sha256")));
 
     // `dvb list` reports it with the timestamp parsed from the name.
     let output = dvb(tmp.path())
@@ -280,9 +285,17 @@ async fn uploads_an_archive_larger_than_one_multipart_part() {
         .into_iter()
         .map(|entry| entry.path().to_owned())
         .collect();
-    assert_eq!(keys.len(), 1, "unexpected objects: {keys:?}");
+    assert_eq!(keys.len(), 2, "unexpected objects: {keys:?}");
+    let archive_key = keys
+        .iter()
+        .find(|k| !k.ends_with(".sha256"))
+        .expect("archive key present");
 
-    let size = client.stat(&keys[0]).await.expect("stat").content_length();
+    let size = client
+        .stat(archive_key)
+        .await
+        .expect("stat")
+        .content_length();
     assert!(
         size > 50 * 1024 * 1024,
         "expected a >50MiB object, got {size} bytes"
