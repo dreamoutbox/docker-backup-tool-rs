@@ -1,1 +1,2 @@
 pre-release-commit-message = "chore: Release v{{version}}"
+consolidate-commits = false
