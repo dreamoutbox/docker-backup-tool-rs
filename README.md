@@ -1,5 +1,7 @@
 # docker-backup-tool-rs
 
+[![CI](https://github.com/dreamoutbox/docker-backup-tool-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dreamoutbox/docker-backup-tool-rs/actions/workflows/ci.yml)
+
 `dvb` — a Docker volume backup tool written in Rust.
 
 It tars and compresses mounted paths, streams the archive to a storage backend
