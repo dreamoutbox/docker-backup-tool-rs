@@ -168,7 +168,7 @@ async fn strict_host_key_checking_refuses_an_unknown_host() {
 [[job]]
 name = "db"
 cron = "0 3 * * *"
-source = ["/nonexistent"]
+source = ["{}"]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
 
   [job.storage]
@@ -179,6 +179,7 @@ filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
   key_path = "{}"
   known_hosts_strategy = "strict"
 "#,
+            tmp.path().display(),
             server.endpoint(),
             fixture("sftp_test_key").display(),
         ),
