@@ -10,7 +10,7 @@
 mod cli;
 
 use dvb::config::{self, Config, JobConfig, ScheduleSource, ValidationMode};
-use dvb::{docker, error, job, restore, retention, scheduler, signal, storage};
+use dvb::{docker, error, init, job, restore, retention, scheduler, signal, storage};
 
 use std::io::IsTerminal as _;
 use std::path::Path;
@@ -73,7 +73,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             expression,
             timezone,
         } => crontext_cmd(expression, timezone.as_deref()),
-        Command::Init { .. } => Err(Error::NotImplemented("init")),
+        Command::Init { output, force } => init::run_init(output, *force),
         Command::Jobs { .. } => Err(Error::NotImplemented("jobs")),
         Command::Restore {
             job,

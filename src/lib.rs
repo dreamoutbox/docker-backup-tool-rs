@@ -8,6 +8,7 @@ pub mod config;
 pub mod docker;
 pub mod error;
 pub mod hooks;
+pub mod init;
 pub mod integrity;
 pub mod job;
 pub mod lock;
