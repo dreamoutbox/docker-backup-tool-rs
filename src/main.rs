@@ -10,7 +10,7 @@
 mod cli;
 
 use dvb::config::{self, Config, JobConfig, ScheduleSource, ValidationMode};
-use dvb::{docker, error, init, job, restore, retention, scheduler, signal, storage};
+use dvb::{docker, error, init, job, jobs, restore, retention, scheduler, signal, storage};
 
 use std::io::IsTerminal as _;
 use std::path::Path;
@@ -74,7 +74,34 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             timezone,
         } => crontext_cmd(expression, timezone.as_deref()),
         Command::Init { output, force } => init::run_init(output, *force),
-        Command::Jobs { .. } => Err(Error::NotImplemented("jobs")),
+        Command::Jobs {
+            format,
+            remote,
+            remote_timeout,
+            now,
+        } => {
+            let now_dt = if let Some(now_str) = now {
+                Some(
+                    chrono::DateTime::parse_from_rfc3339(now_str)
+                        .map_err(|err| {
+                            Error::Config(dvb::error::ConfigError::Invalid(format!(
+                                "invalid --now timestamp `{now_str}`: {err}"
+                            )))
+                        })?
+                        .with_timezone(&chrono::Utc),
+                )
+            } else {
+                None
+            };
+            jobs::run_jobs(
+                &cli.global.config,
+                *format,
+                *remote,
+                std::time::Duration::from_secs(*remote_timeout),
+                now_dt,
+            )
+            .await
+        }
         Command::Restore {
             job,
             name,
@@ -610,6 +637,7 @@ mod tests {
                 format: cli::JobsFormat::Table,
                 remote: false,
                 remote_timeout: 15,
+                now: None,
             }),
             "jobs failed"
         );

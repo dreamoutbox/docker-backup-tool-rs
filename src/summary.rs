@@ -32,6 +32,25 @@ pub struct JobSummary {
     pub post: Vec<HookSummary>,
     /// Next scheduled execution time in the job's timezone.
     pub next_run: Option<DateTime<FixedOffset>>,
+    /// Remote storage statistics (populated only when `--remote` is requested).
+    pub remote: Option<RemoteSummary>,
+}
+
+/// Secret-free remote storage status for a configured job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteSummary {
+    pub last_backup: Option<String>,
+    pub count: u64,
+    pub total_bytes: u64,
+    pub error: Option<String>,
+}
+
+/// JSON view model emitted by `dvb jobs --format json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JobsOutput {
+    pub schema_version: u32,
+    pub generated_at: DateTime<Utc>,
+    pub jobs: Vec<JobSummary>,
 }
 
 /// Secret-free storage configuration summary.
@@ -195,6 +214,7 @@ pub fn summarize(cfg: &Config, now: DateTime<Utc>) -> Vec<JobSummary> {
                 pre: job.pre.iter().map(HookSummary::from_pre_hook).collect(),
                 post: job.post.iter().map(HookSummary::from_post_hook).collect(),
                 next_run,
+                remote: None,
             }
         })
         .collect()
@@ -204,6 +224,35 @@ pub fn summarize(cfg: &Config, now: DateTime<Utc>) -> Vec<JobSummary> {
 #[must_use]
 pub fn stdout_is_colored_terminal() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|val| val.is_empty())
+}
+
+/// Format byte count into human-readable representation.
+#[must_use]
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        let whole = bytes / KIB;
+        let frac = (bytes % KIB) * 10 / KIB;
+        format!("{whole}.{frac} KiB")
+    } else if bytes < GIB {
+        let whole = bytes / MIB;
+        let frac = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{frac} MiB")
+    } else if bytes < TIB {
+        let whole = bytes / GIB;
+        let frac = (bytes % GIB) * 10 / GIB;
+        format!("{whole}.{frac} GiB")
+    } else {
+        let whole = bytes / TIB;
+        let frac = (bytes % TIB) * 10 / TIB;
+        format!("{whole}.{frac} TiB")
+    }
 }
 
 #[cfg(test)]

@@ -61,15 +61,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-#[value(rename_all = "lowercase")]
-pub enum JobsFormat {
-    /// Human-readable table layout (default).
-    #[default]
-    Table,
-    /// JSON view model output.
-    Json,
-}
+pub use dvb::jobs::JobsFormat;
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -192,6 +184,10 @@ pub enum Command {
         /// Timeout in seconds per job when querying remote storage.
         #[arg(long, default_value_t = 15, value_name = "SECS")]
         remote_timeout: u64,
+
+        /// Override current timestamp for reproducible output (hidden, RFC3339).
+        #[arg(long, hide = true)]
+        now: Option<String>,
     },
 }
 

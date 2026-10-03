@@ -652,10 +652,6 @@ impl Config {
     ///
     /// [`ConfigError::Invalid`] naming the first problem found.
     pub fn validate_static(&mut self) -> Result<()> {
-        if self.jobs.is_empty() {
-            return Err(invalid("no [[job]] defined"));
-        }
-
         let mut seen = BTreeSet::new();
         for job in &mut self.jobs {
             if job.name.trim().is_empty() {
@@ -688,6 +684,9 @@ impl Config {
     ///
     /// [`ConfigError::Invalid`] naming the first missing path or unreadable file.
     pub fn validate_runtime(&self) -> Result<()> {
+        if self.jobs.is_empty() {
+            return Err(invalid("no [[job]] defined"));
+        }
         for job in &self.jobs {
             job.validate_runtime(&self.docker)?;
         }

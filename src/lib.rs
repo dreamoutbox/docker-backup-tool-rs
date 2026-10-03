@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod init;
 pub mod integrity;
 pub mod job;
+pub mod jobs;
 pub mod lock;
 pub mod restore;
 pub mod retention;
