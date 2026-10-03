@@ -1,0 +1,56 @@
+[docker]
+socket = "/var/run/docker.sock"
+
+[[job]]
+name = "db"
+cron = "0 18 * * 5"
+timezone = "UTC"
+source = ["/backup/pgdata"]
+filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
+compression = "zstd"
+retention_days = 14
+min_keep = 3
+stop_containers = ["postgres"]
+  [job.storage]
+  type = "s3"
+  bucket = "bk"
+  region = "eu-west-1"
+  prefix = "db/"
+  [[job.pre]]
+  cmd = ["pg_dump", "-U", "postgres"]
+  container = "postgres"
+  timeout_secs = 300
+  [[job.post]]
+  cmd = ["/bin/notify.sh", "ok"]
+  run_on = "always"
+  timeout_secs = 60
+
+[[job]]
+name = "web"
+crontext = "every friday at 18:00"
+timezone = "Europe/Berlin"
+source = ["/var/www/html", "/var/www/uploads"]
+filename = "web-%Y%m%dT%H%M%SZ.tar.zst"
+compression = "zstd"
+retention_days = 7
+min_keep = 2
+  [job.storage]
+  type = "fs"
+  root = "/backup/storage"
+  prefix = "web"
+
+[[job]]
+name = "logs"
+cron = "0 0 * * *"
+timezone = "UTC"
+source = ["/var/log"]
+filename = "logs-%Y%m%dT%H%M%SZ.tar.zst"
+compression = "gzip"
+retention_days = 30
+min_keep = 5
+  [job.storage]
+  type = "sftp"
+  endpoint = "sftp.example.com:22"
+  user = "backupuser"
+  root = "/remote/logs"
+  known_hosts_strategy = "strict"

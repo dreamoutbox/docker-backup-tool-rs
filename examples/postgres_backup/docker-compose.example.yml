@@ -19,11 +19,22 @@
 # Checking configuration and connectivity:
 #   docker exec backup dvb check
 #
-# Restoring a backup (to default job.restore.dir without script):
+# Restoring a backup (default restore script from dvb.toml):
 #   docker exec backup dvb restore db
 #
-# Restoring a backup and executing restore hook script:
+# Restoring a backup with an explicit restore hook script:
 #   docker exec backup dvb restore db --script /scripts/pg_restore.sh
+#
+# How the pg_dump backup flow works:
+#   1. dvb runs /scripts/pg_backup.sh (pre_backup_script) before each backup.
+#   2. pg_backup.sh calls pg_dump inside the 'db' container via docker exec
+#      and writes dump.sql to /backup/pgdump (a shared staging volume).
+#   3. dvb archives /backup/pgdump, compresses it, and uploads it to S3.
+#   4. On restore, dvb extracts the archive and runs /scripts/pg_restore.sh.
+
+volumes:
+  pgdump:
+  pgdata:
 
 services:
   # Database service to back up
@@ -37,6 +48,9 @@ services:
       POSTGRES_DB: app
     volumes:
       - pgdata:/var/lib/postgresql
+      # Staging volume shared with the dvb container so the pre-backup hook
+      # can write dump.sql here via docker exec without needing docker CLI in dvb.
+      - pgdump:/backup/pgdump
 
   # S3-compatible object storage gateway (SeaweedFS)
   s3:
@@ -70,8 +84,9 @@ services:
       db:
         condition: service_started
     volumes:
-      # Volumes to back up must be mounted read-only (:ro)
-      - pgdata:/backup/pgdata:ro
+      # Staging directory where pg_backup.sh writes dump.sql before dvb archives it.
+      # Must be writable (no :ro) so the pre-backup script can create the dump file.
+      - pgdump:/backup/pgdump
       # Configuration file
       - ./dvb.example.toml:/etc/dvb/config.toml:ro
       # Docker socket for container control (stop/start/exec).
@@ -81,15 +96,10 @@ services:
       #   CONTAINERS=1
       #   POST=1
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Restore scripts directory (optional).
-      # NOTE: Restore scripts execute inside this backup container, NOT on the host or
-      # inside target database containers. Database client tools (like pg_restore) must
-      # either be installed in the backup container image, or the script must invoke
-      # `docker exec` against the target container (via the Docker socket).
+      # Scripts directory: pg_backup.sh (pre-backup) and pg_restore.sh (restore hook)
       - ./scripts:/scripts:ro
     environment:
       - TZ=UTC
       - DVB_LOG=dvb=info
-
-volumes:
-  pgdata:
+      # Passed through to pg_backup.sh
+      - PGPASSWORD=postgrespassword

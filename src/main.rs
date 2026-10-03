@@ -9,8 +9,8 @@
 
 mod cli;
 
-use dvb::config::{self, Config, JobConfig, ScheduleSource};
-use dvb::{docker, error, job, restore, retention, scheduler, signal, storage};
+use dvb::config::{self, Config, JobConfig, ScheduleSource, ValidationMode};
+use dvb::{docker, error, init, job, jobs, restore, retention, scheduler, signal, storage};
 
 use std::io::IsTerminal as _;
 use std::path::Path;
@@ -73,6 +73,35 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
             expression,
             timezone,
         } => crontext_cmd(expression, timezone.as_deref()),
+        Command::Init { output, force } => init::run_init(output, *force),
+        Command::Jobs {
+            format,
+            remote,
+            remote_timeout,
+            now,
+        } => {
+            let now_dt = if let Some(now_str) = now {
+                Some(
+                    chrono::DateTime::parse_from_rfc3339(now_str)
+                        .map_err(|err| {
+                            Error::Config(dvb::error::ConfigError::Invalid(format!(
+                                "invalid --now timestamp `{now_str}`: {err}"
+                            )))
+                        })?
+                        .with_timezone(&chrono::Utc),
+                )
+            } else {
+                None
+            };
+            jobs::run_jobs(
+                &cli.global.config,
+                *format,
+                *remote,
+                std::time::Duration::from_secs(*remote_timeout),
+                now_dt,
+            )
+            .await
+        }
         Command::Restore {
             job,
             name,
@@ -119,7 +148,7 @@ async fn dispatch(cli: &Cli) -> anyhow::Result<u8> {
 
 /// `dvb run`: start the scheduler daemon and execute jobs on their cron schedules.
 async fn run(global: &GlobalArgs) -> error::Result<u8> {
-    let config = Config::load(&global.config)?;
+    let config = Config::load(&global.config, ValidationMode::Full)?;
     scheduler::run(config).await
 }
 
@@ -129,7 +158,7 @@ async fn run(global: &GlobalArgs) -> error::Result<u8> {
 /// retention failed, and 1 when a container could not be restarted, so a caller
 /// can tell "safe but needs attention" apart from a hard failure.
 async fn backup(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
-    let config = Config::load(&global.config)?;
+    let config = Config::load(&global.config, ValidationMode::Full)?;
     let job = config.job(job_name)?;
 
     let op = storage::operator(&job.storage)?;
@@ -145,7 +174,7 @@ async fn backup(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
 
 /// `dvb prune <job> [--dry-run]`: apply retention without a new backup.
 async fn prune(global: &GlobalArgs, job_name: &str, dry_run: bool) -> error::Result<u8> {
-    let config = Config::load(&global.config)?;
+    let config = Config::load(&global.config, ValidationMode::Full)?;
     let job = config.job(job_name)?;
     let op = storage::operator(&job.storage)?;
 
@@ -167,7 +196,7 @@ async fn prune(global: &GlobalArgs, job_name: &str, dry_run: bool) -> error::Res
 
 /// `dvb list <job>`: what is stored, with the timestamp parsed from the name.
 async fn list(global: &GlobalArgs, job_name: &str) -> error::Result<u8> {
-    let config = Config::load(&global.config)?;
+    let config = Config::load(&global.config, ValidationMode::Full)?;
     let job = config.job(job_name)?;
     let op = storage::operator(&job.storage)?;
 
@@ -200,7 +229,7 @@ async fn restore(
     job_name: &str,
     options: restore::RestoreOptions,
 ) -> error::Result<u8> {
-    let config = Config::load(&global.config)?;
+    let config = Config::load(&global.config, ValidationMode::Full)?;
     let job = config.job(job_name)?;
     let op = storage::operator(&job.storage)?;
 
@@ -229,7 +258,7 @@ async fn restore(
 /// just a list, because list succeeds on many backends where write needs
 /// different permissions.
 async fn check(global: &GlobalArgs) -> error::Result<u8> {
-    let config = Config::load(&global.config)?;
+    let config = Config::load(&global.config, ValidationMode::Full)?;
     println!("configuration at {} is valid", global.config.display());
     println!("{} job(s) defined", config.job_count());
 
@@ -489,6 +518,8 @@ fn describe(command: &Command) -> String {
         }
         Command::Check => "configuration check failed".to_owned(),
         Command::Crontext { .. } => "crontext evaluation failed".to_owned(),
+        Command::Init { .. } => "init failed".to_owned(),
+        Command::Jobs { .. } => "jobs failed".to_owned(),
     }
 }
 
@@ -593,6 +624,22 @@ mod tests {
                 timezone: None,
             }),
             "crontext evaluation failed"
+        );
+        assert_eq!(
+            describe(&Command::Init {
+                output: String::new(),
+                force: false,
+            }),
+            "init failed"
+        );
+        assert_eq!(
+            describe(&Command::Jobs {
+                format: cli::JobsFormat::Table,
+                remote: false,
+                remote_timeout: 15,
+                now: None,
+            }),
+            "jobs failed"
         );
     }
 }

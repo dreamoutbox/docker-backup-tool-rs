@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-02T12:00:00Z",
+  "jobs": [
+    {
+      "name": "db",
+      "cron": "0 18 * * 5",
+      "crontext": null,
+      "timezone": "UTC",
+      "source": [
+        "/backup/pgdata"
+      ],
+      "filename": "pgdata-%Y%m%dT%H%M%SZ.tar.zst",
+      "compression": "zstd",
+      "retention_days": 14,
+      "min_keep": 3,
+      "stop_containers": [
+        "postgres"
+      ],
+      "storage": {
+        "type": "s3",
+        "bucket": "bk",
+        "region": "eu-west-1",
+        "prefix": "db/"
+      },
+      "pre": [
+        {
+          "cmd": [
+            "pg_dump"
+          ],
+          "container": "postgres",
+          "timeout_secs": 300
+        }
+      ],
+      "post": [
+        {
+          "cmd": [
+            "/bin/notify.sh"
+          ],
+          "timeout_secs": 60,
+          "run_on": "always"
+        }
+      ],
+      "next_run": "2026-10-02T18:00:00Z",
+      "remote": null
+    },
+    {
+      "name": "web",
+      "cron": "0 18 * * 5",
+      "crontext": "every friday at 18:00",
+      "timezone": "Europe/Berlin",
+      "source": [
+        "/var/www/html",
+        "/var/www/uploads"
+      ],
+      "filename": "web-%Y%m%dT%H%M%SZ.tar.zst",
+      "compression": "zstd",
+      "retention_days": 7,
+      "min_keep": 2,
+      "stop_containers": [],
+      "storage": {
+        "type": "fs",
+        "root": "/backup/storage",
+        "prefix": "web"
+      },
+      "pre": [],
+      "post": [],
+      "next_run": "2026-10-02T18:00:00+02:00",
+      "remote": null
+    },
+    {
+      "name": "logs",
+      "cron": "0 0 * * *",
+      "crontext": null,
+      "timezone": "UTC",
+      "source": [
+        "/var/log"
+      ],
+      "filename": "logs-%Y%m%dT%H%M%SZ.tar.zst",
+      "compression": "gzip",
+      "retention_days": 30,
+      "min_keep": 5,
+      "stop_containers": [],
+      "storage": {
+        "type": "sftp",
+        "endpoint": "sftp.example.com:22",
+        "user": "backupuser",
+        "root": "/remote/logs",
+        "known_hosts_strategy": "strict"
+      },
+      "pre": [],
+      "post": [],
+      "next_run": "2026-10-03T00:00:00Z",
+      "remote": null
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+## dvb reference configuration
+##
+## Convention:
+## - Uncommented lines are required options forming a minimal valid config.
+## - Optional settings are commented out with `# `, preceded by `## optional: <description>`.
+## - Alternative storage backends are commented out under `## alternative storage: <type>`.
+## - Never store secrets inline in production. Use file mounts (e.g. /run/secrets/...)
+##   or environment variable overrides (e.g. DVB__JOB__0__STORAGE__SECRET_ACCESS_KEY).
+
+## optional: Seconds to wait for running jobs to finish when shutting down before cancelling them.
+# shutdown_grace_secs = 60
+
+## optional: Docker daemon settings for container stopping and container hooks.
+# [docker]
+## optional: Path to the Docker unix socket.
+# socket = "/var/run/docker.sock"
+
+[[job]]
+name = "backup"
+crontext = "every day at 03:00"
+## optional: 5-field cron schedule (use either cron or crontext, not both).
+# cron = "0 3 * * *"
+source = ["/backup/data"]
+filename = "backup-%Y%m%dT%H%M%SZ.tar.zst"
+compression = "zstd"
+retention_days = 14
+min_keep = 3
+
+## optional: Timezone for schedule evaluation (e.g. "Europe/Berlin", "UTC"). Defaults to system TZ or UTC.
+# timezone = "Europe/Berlin"
+
+## optional: Run this job immediately on daemon startup before its first scheduled run.
+# run_on_start = true
+
+## optional: Store symlink target contents instead of archiving symlinks as symlinks.
+# follow_symlinks = false
+
+## optional: Containers to stop during backup for consistency, then restart.
+# stop_containers = ["postgres"]
+
+## optional: Label selector (key=value) matching containers to stop during backup.
+# stop_label = "dvb.backup=true"
+
+## optional: Seconds to wait for containers to stop cleanly before killing.
+# stop_timeout_secs = 30
+
+## optional: Default restore settings for this job.
+# [job.restore]
+## optional: Default directory for backup extraction.
+# dir = "/restore"
+## optional: Default restore script to execute after extraction.
+# script = "/scripts/pg_restore.sh"
+## optional: Timeout in seconds for the restore script.
+# script_timeout_secs = 3600
+
+## optional: Pre-backup hook executed before archiving.
+# [[job.pre]]
+## optional: Executable and arguments run without a shell.
+# cmd = ["pg_dump", "-U", "postgres", "-d", "mydb"]
+## optional: Container to run the hook in. Omit to run locally in the dvb container.
+# container = "postgres"
+## optional: Hook timeout in seconds.
+# timeout_secs = 300
+
+## optional: Post-backup hook executed after archiving.
+# [[job.post]]
+## optional: Executable and arguments run without a shell.
+# cmd = ["/bin/notify.sh", "Backup completed"]
+## optional: When to run the hook: "success" (default), "failure", or "always".
+# run_on = "always"
+## optional: Hook timeout in seconds.
+# timeout_secs = 60
+
+[job.storage]
+type = "s3"
+bucket = "my-backup-bucket"
+region = "us-east-1"
+prefix = "backups"
+## optional: Custom endpoint URL for MinIO, Cloudflare R2, Wasabi, SeaweedFS, etc.
+# endpoint = "http://minio:9000"
+## optional: S3 access key ID (or set via DVB__JOB__0__STORAGE__ACCESS_KEY_ID or /run/secrets).
+# access_key_id = "minioadmin"
+## optional: S3 secret access key (or set via DVB__JOB__0__STORAGE__SECRET_ACCESS_KEY or /run/secrets).
+# secret_access_key = "minioadmin"
+## optional: Address bucket as path (endpoint/bucket) rather than virtual host (bucket.endpoint).
+# force_path_style = true
+
+## alternative storage: fs
+# [job.storage]
+# type = "fs"
+# root = "/backup/storage"
+# prefix = "backups"
+
+## alternative storage: sftp
+# [job.storage]
+# type = "sftp"
+# endpoint = "sftp.example.com:22"
+# user = "backupuser"
+# root = "/remote/backups"
+# key_path = "/run/secrets/id_ed25519"
+# known_hosts_strategy = "strict"
+
+## alternative storage: dropbox
+# [job.storage]
+# type = "dropbox"
+# root = "/backups"
+# client_id = "/run/secrets/dropbox_client_id"
+# client_secret = "/run/secrets/dropbox_client_secret"
+# refresh_token = "/run/secrets/dropbox_refresh_token"

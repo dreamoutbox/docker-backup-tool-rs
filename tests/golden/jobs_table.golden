@@ -1,0 +1,4 @@
+ NAME  SCHEDULE               NEXT RUN                 STORAGE                                            RETENTION     SOURCES           
+ db    0 18 * * 5             2026-10-02 18:00 +00:00  s3://bk/db/                                        14d, keep>=3  /backup/pgdata    
+ web   every friday at 18:00  2026-10-02 18:00 +02:00  file:///backup/storage                             7d, keep>=2   /var/www/html, +1 
+ logs  0 0 * * *              2026-10-03 00:00 +00:00  sftp://backupuser@sftp.example.com:22/remote/logs  30d, keep>=5  /var/log          

@@ -95,9 +95,9 @@ When `--script` or `[job.restore].script` is specified:
 
 ---
 
-## Reference PostgreSQL Restore Hook (`examples/pg_restore.sh`)
+## Reference PostgreSQL Restore Hook (`examples/postgres_backup/scripts/pg_restore.sh`)
 
-`examples/pg_restore.sh` is provided as a reference PostgreSQL restore script. It supports both plain SQL dumps (`dump.sql`) via `psql` and custom archive dumps (`dump.dump`, `dump.tar`) via `pg_restore`.
+`examples/postgres_backup/scripts/pg_restore.sh` is provided as a reference PostgreSQL restore script. It supports both plain SQL dumps (`dump.sql`) via `psql` and custom archive dumps (`dump.dump`, `dump.tar`) via `pg_restore`.
 
 It works in two modes:
 - **Local:** If `psql` or `pg_restore` is available in PATH, it runs them directly.
@@ -107,16 +107,16 @@ It works in two modes:
 
 ```sh
 # 1. Restore the newest backup using the custom script hook:
-dvb restore db --script ./examples/pg_restore.sh
+dvb restore db --script ./examples/postgres_backup/scripts/pg_restore.sh
 
 # 2. Forward extra flags to pg_restore (e.g. clean existing objects):
-dvb restore db --script ./examples/pg_restore.sh -- --clean --if-exists
+dvb restore db --script ./examples/postgres_backup/scripts/pg_restore.sh -- --clean --if-exists
 
 # 3. Restore to a point in time before an incident:
-dvb restore db --at 2026-10-01T14:00:00Z --script ./examples/pg_restore.sh
+dvb restore db --at 2026-10-01T14:00:00Z --script ./examples/postgres_backup/scripts/pg_restore.sh
 
 # 4. Stop the database container during restore and cleanup temporary files on success:
-dvb restore db --script ./examples/pg_restore.sh --stop-containers --cleanup
+dvb restore db --script ./examples/postgres_backup/scripts/pg_restore.sh --stop-containers --cleanup
 
 # 5. Extract files directly into a specific folder without running a script:
 dvb restore db --to /mnt/data/postgres_restored

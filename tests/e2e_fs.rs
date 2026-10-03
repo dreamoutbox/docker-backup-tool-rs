@@ -325,7 +325,7 @@ fn a_missing_source_fails_and_leaves_nothing_behind() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("archive error"),
+        stderr.contains("archive error") || stderr.contains("does not exist"),
         "unhelpful error: {stderr}"
     );
 
@@ -1024,8 +1024,12 @@ fn restore_stop_containers_validation_checks() {
 
 #[test]
 fn example_pg_restore_script_execution_and_help() {
-    let script_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/pg_restore.sh");
-    assert!(script_path.exists(), "examples/pg_restore.sh must exist");
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/postgres_backup/scripts/pg_restore.sh");
+    assert!(
+        script_path.exists(),
+        "examples/postgres_backup/scripts/pg_restore.sh must exist"
+    );
 
     // 1. --help exits 0 and displays usage
     let help_res = std::process::Command::new(&script_path)

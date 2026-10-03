@@ -17,6 +17,8 @@ each phase.
 | Command | Effect |
 |---|---|
 | `dvb run` | Run the scheduler daemon and execute jobs on their cron schedules |
+| `dvb init [-o <path>] [--force]` | Generate a full, documented reference configuration file |
+| `dvb jobs [--remote] [--format table\|json]` | List all configured backup jobs with schedules, storage, and optional remote stats |
 | `dvb backup <job>` | Archive the job's sources to storage, right now |
 | `dvb restore <job>` | Download and extract a backup to a directory safely |
 | `dvb list <job>` | List stored backups with their size and parsed timestamp |
@@ -29,15 +31,44 @@ each phase.
 | Exit Code | Name | Meaning |
 |---|---|---|
 | `0` | Success | Operation completed successfully |
-| `1` | Failure | Backup, restore, prune, or check failed (pre-hooks failed, extraction failed, checksum mismatch, container start failure) |
-| `2` | Partial | Backup archive reached storage successfully, but post-hooks, sidecar checksum write, or retention prune failed |
+| `1` | Failure | Backup, restore, prune, check, init, or jobs failed (pre-hooks failed, extraction failed, checksum mismatch, container start failure, missing or invalid config) |
+| `2` | Partial | Backup archive reached storage successfully, but post-hooks, sidecar checksum write, or retention prune failed; or for `dvb jobs --remote`, at least one remote query failed |
 | `3` | Script Failure | Restore archive was verified and extracted successfully, but the restore hook script failed or timed out |
 
 A failed run never leaves a partial object behind, so a truncated archive cannot be mistaken for a good backup.
 
 ## Quick Start
 
-Run the example environment with Docker Compose:
+### 1. Generate a starter configuration
+
+Generate a fully documented reference configuration file using `dvb init`:
+
+```sh
+# Via stdout redirect:
+docker run --rm dreamoutbox/dvb init -o - > config.toml
+
+# Or direct write to a mounted directory with host user permissions:
+docker run --rm -v "$PWD":/work -w /work --user "$(id -u):$(id -g)" dreamoutbox/dvb init -o dvb.toml
+```
+
+- **Safety & Permissions:** `init` creates files with mode `0600` (read/write by owner only) and never overwrites an existing file unless `--force` is specified.
+- **Secrets:** Generated configurations use file-based secret conventions (e.g. `/run/secrets/...`) or environment variables (`DVB__JOB__0__STORAGE__...`). Fill these in before running `dvb check`.
+
+### 2. Inspect configured jobs
+
+Preview configured jobs offline:
+
+```sh
+# Inspect jobs in tabular format
+docker run --rm -v "$PWD/dvb.toml":/etc/dvb/config.toml:ro dreamoutbox/dvb jobs
+
+# Or check remote storage for backup count and total size
+docker run --rm -v "$PWD/dvb.toml":/etc/dvb/config.toml:ro dreamoutbox/dvb jobs --remote
+```
+
+### 3. Run with Docker Compose
+
+Run the example environment:
 
 ```sh
 # Start the backup daemon, database and SeaweedFS S3 gateway
@@ -60,9 +91,87 @@ docker exec backup dvb list db
 docker exec backup dvb prune db --dry-run
 ```
 
+## Inspecting jobs
+
+`dvb jobs` provides an offline-by-default view of all configured backup jobs without requiring the Docker socket, filesystem access to source data, or network locks.
+
+Options:
+
+| Flag | Purpose |
+|---|---|
+| `--format table` | Default tabular view with borders |
+| `--format json` | Structured JSON output conforming to `schema_version: 1` |
+| `--remote` | Query remote storage backends for backup counts, total size, and latest backup timestamp |
+| `--remote-timeout <secs>` | Per-job query timeout in seconds for remote queries (default: 10) |
+
+### Table format
+
+```sh
+dvb jobs
+```
+
+Output:
+```
++--------+--------------------+-------------------------+-------------------------------+--------------+---------------+
+| NAME   | SCHEDULE           | NEXT RUN                | STORAGE                       | RETENTION    | SOURCES       |
++--------+--------------------+-------------------------+-------------------------------+--------------+---------------+
+| backup | every day at 03:00 | 2026-10-04 03:00 +00:00 | s3://my-backup-bucket/backups | 14d, keep>=3 | /backup/data  |
++--------+--------------------+-------------------------+-------------------------------+--------------+---------------+
+```
+
+When `--remote` is passed, three additional columns appear: `LAST BACKUP`, `COUNT`, and `SIZE` (e.g. `128.00 MiB`).
+
+### JSON format
+
+```sh
+dvb jobs --format json
+```
+
+Output (pretty-printed when stdout is a terminal, compact when piped):
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-03T07:00:00Z",
+  "jobs": [
+    {
+      "name": "backup",
+      "cron": "0 3 * * *",
+      "crontext": "every day at 03:00",
+      "timezone": "UTC",
+      "source": [
+        "/backup/data"
+      ],
+      "filename": "backup-%Y%m%dT%H%M%SZ.tar.zst",
+      "compression": "zstd",
+      "retention_days": 14,
+      "min_keep": 3,
+      "storage": {
+        "type": "s3",
+        "bucket": "my-backup-bucket",
+        "region": "us-east-1",
+        "prefix": "backups"
+      },
+      "next_run": "2026-10-04T03:00:00+00:00",
+      "remote": null
+    }
+  ]
+}
+```
+
+When `--remote` is enabled, each job's `remote` object is populated:
+```json
+"remote": {
+  "last_backup": "2026-10-03T03:00:00+00:00",
+  "count": 4,
+  "total_bytes": 134217728,
+  "error": null
+}
+```
+If a storage backend fails or times out, `remote.error` contains a sanitized error description, other jobs continue querying concurrently, and `dvb jobs` exits with code `2`.
+
 ## Configuration
 
-TOML, at `/etc/dvb/config.toml` by default.
+TOML, at `/etc/dvb/config.toml` by default. See [`docs/config-reference.md`](docs/config-reference.md) for the complete reference of all configuration options.
 
 ```toml
 # Top-level settings
