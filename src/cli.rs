@@ -61,6 +61,16 @@ pub enum LogFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum JobsFormat {
+    /// Human-readable table layout (default).
+    #[default]
+    Table,
+    /// JSON view model output.
+    Json,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Run the scheduler and execute every configured job on its cron schedule.
@@ -157,6 +167,32 @@ pub enum Command {
         #[arg(long, short)]
         timezone: Option<String>,
     },
+
+    /// Write a full reference configuration file.
+    Init {
+        /// Output path for the reference config (or "-" for stdout).
+        #[arg(short, long, default_value = "./dvb.toml", value_name = "PATH")]
+        output: String,
+
+        /// Overwrite the target file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// List all configured backup jobs.
+    Jobs {
+        /// Output format (table or json).
+        #[arg(long, value_enum, default_value_t = JobsFormat::Table)]
+        format: JobsFormat,
+
+        /// Query storage backends for backup statistics (last backup, count, size).
+        #[arg(long)]
+        remote: bool,
+
+        /// Timeout in seconds per job when querying remote storage.
+        #[arg(long, default_value_t = 15, value_name = "SECS")]
+        remote_timeout: u64,
+    },
 }
 
 #[cfg(test)]
@@ -179,7 +215,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "run", "backup", "prune", "list", "check", "restore", "crontext"
+                "run", "backup", "prune", "list", "check", "restore", "crontext", "init", "jobs"
             ]
         );
     }

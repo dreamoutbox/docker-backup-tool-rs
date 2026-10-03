@@ -16,6 +16,7 @@ pub mod retention;
 pub mod scheduler;
 pub mod signal;
 pub mod storage;
+pub mod summary;
 
 #[cfg(test)]
 mod testutil;

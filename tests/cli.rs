@@ -9,7 +9,7 @@ fn help_lists_every_subcommand() {
     let output = dvb().arg("--help").assert().success();
     let stdout = String::from_utf8(output.get_output().stdout.clone()).expect("utf-8 stdout");
     for subcommand in [
-        "run", "backup", "prune", "list", "check", "restore", "crontext",
+        "run", "backup", "prune", "list", "check", "restore", "crontext", "init", "jobs",
     ] {
         assert!(
             stdout.contains(subcommand),
@@ -105,4 +105,22 @@ fn crontext_cli_evaluates_schedule() {
     assert!(stdout.contains("every friday at 18:00"));
     assert!(stdout.contains("timezone:    UTC"));
     assert!(stdout.contains("next 5 fire times:"));
+}
+
+#[test]
+fn init_help_lists_all_flags() {
+    let output = dvb().args(["init", "--help"]).assert().success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).expect("utf-8 stdout");
+    assert!(stdout.contains("--output") && stdout.contains("-o"));
+    assert!(stdout.contains("--force"));
+}
+
+#[test]
+fn jobs_help_lists_all_flags() {
+    let output = dvb().args(["jobs", "--help"]).assert().success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).expect("utf-8 stdout");
+    assert!(stdout.contains("--config"));
+    assert!(stdout.contains("--format"));
+    assert!(stdout.contains("--remote"));
+    assert!(stdout.contains("--remote-timeout"));
 }

@@ -382,6 +382,55 @@ impl StorageConfig {
             format!("{prefix}/{object}")
         }
     }
+
+    /// Check that required keys are present and non-empty.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] when required fields are missing or empty.
+    pub fn validate_static(&self) -> Result<()> {
+        match self {
+            Self::Fs(cfg) => {
+                if cfg.root.as_os_str().is_empty() {
+                    return Err(invalid("fs storage requires a non-empty `root`"));
+                }
+            }
+            Self::S3(cfg) => {
+                if cfg.bucket.trim().is_empty() {
+                    return Err(invalid("s3 storage requires a non-empty `bucket`"));
+                }
+                if cfg.region.trim().is_empty() {
+                    return Err(invalid("s3 storage requires a non-empty `region`"));
+                }
+            }
+            Self::Sftp(cfg) => {
+                if cfg.endpoint.trim().is_empty() {
+                    return Err(invalid("sftp storage requires a non-empty `endpoint`"));
+                }
+                if cfg.user.trim().is_empty() {
+                    return Err(invalid("sftp storage requires a non-empty `user`"));
+                }
+                if cfg.root.trim().is_empty() {
+                    return Err(invalid("sftp storage requires a non-empty `root`"));
+                }
+            }
+            Self::Dropbox(cfg) => {
+                if cfg.root.trim().is_empty() {
+                    return Err(invalid("dropbox storage requires a non-empty `root`"));
+                }
+                if cfg.client_id.is_empty() {
+                    return Err(invalid("dropbox storage requires `client_id`"));
+                }
+                if cfg.client_secret.is_empty() {
+                    return Err(invalid("dropbox storage requires `client_secret`"));
+                }
+                if cfg.refresh_token.is_empty() {
+                    return Err(invalid("dropbox storage requires `refresh_token`"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `fs` backend settings.
@@ -513,6 +562,30 @@ impl From<&str> for SecretString {
     }
 }
 
+/// Validation mode controlling whether filesystem checks are performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationMode {
+    /// Schema-level checks only, no filesystem or network operations.
+    Static,
+    /// Schema-level checks plus filesystem checks (source paths exist, secrets readable, socket present).
+    Full,
+}
+
+/// Validate whether `name` matches `^[a-z0-9][a-z0-9_-]{0,62}$`.
+#[must_use]
+pub fn is_valid_job_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
 impl Config {
     /// Load, merge and validate the configuration file at `path`.
     ///
@@ -521,7 +594,7 @@ impl Config {
     /// [`ConfigError::Read`] if the file cannot be read, [`ConfigError::Parse`]
     /// if it is not valid TOML or has an unexpected shape, and
     /// [`ConfigError::Invalid`] if it parses but a job does not make sense.
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, mode: ValidationMode) -> Result<Self> {
         let figment = Figment::new()
             .merge(NormalizedToml(path))
             .merge(Env::prefixed(ENV_PREFIX).split("__").lowercase(true));
@@ -531,7 +604,13 @@ impl Config {
             source,
         })?;
 
-        config.validate()?;
+        match mode {
+            ValidationMode::Static => config.validate_static()?,
+            ValidationMode::Full => {
+                config.validate_static()?;
+                config.validate_runtime()?;
+            }
+        }
         Ok(config)
     }
 
@@ -563,17 +642,16 @@ impl Config {
         self.jobs.len()
     }
 
-    /// Structural validation: names unique and non-empty, cron parses,
-    /// filename contains a second-resolution timestamp, retention sane,
-    /// source list non-empty and duplicate basenames rejected.
+    /// Schema-level checks only: names unique and matching path-safe rules,
+    /// cron/crontext parse, filename contains a second-resolution timestamp,
+    /// retention sane, source list non-empty and duplicate basenames rejected.
     ///
-    /// This is pure: it touches no filesystem, so it is safe to call at load
-    /// time and from tests alike.
+    /// Touches no filesystem or network.
     ///
     /// # Errors
     ///
     /// [`ConfigError::Invalid`] naming the first problem found.
-    pub fn validate(&mut self) -> Result<()> {
+    pub fn validate_static(&mut self) -> Result<()> {
         if self.jobs.is_empty() {
             return Err(invalid("no [[job]] defined"));
         }
@@ -583,10 +661,16 @@ impl Config {
             if job.name.trim().is_empty() {
                 return Err(invalid("job name must not be empty"));
             }
+            if !is_valid_job_name(&job.name) {
+                return Err(invalid(format!(
+                    "job `{}`: invalid job name, must match ^[a-z0-9][a-z0-9_-]{{0,62}}$ (1-63 lowercase alphanumeric, `_` or `-`, starting with alphanumeric)",
+                    job.name
+                )));
+            }
             if !seen.insert(job.name.clone()) {
                 return Err(invalid(format!("duplicate job name `{}`", job.name)));
             }
-            job.validate()?;
+            job.validate_static()?;
             if job.needs_docker() && self.docker.socket.is_none() {
                 return Err(invalid(format!(
                     "job `{}` stops containers or runs a container hook, but [docker] socket is not set",
@@ -595,6 +679,28 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Filesystem checks: source paths exist, secret files readable, Docker socket
+    /// path present when containers need to be stopped or container hooks executed.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first missing path or unreadable file.
+    pub fn validate_runtime(&self) -> Result<()> {
+        for job in &self.jobs {
+            job.validate_runtime(&self.docker)?;
+        }
+        Ok(())
+    }
+
+    /// Legacy validation method, performing static validation.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first problem found.
+    pub fn validate(&mut self) -> Result<()> {
+        self.validate_static()
     }
 }
 
@@ -716,13 +822,13 @@ impl JobConfig {
         Ok(())
     }
 
-    /// Validate a single job and resolve its schedule if needed.
+    /// Schema-level checks for a single job and schedule resolution.
     ///
     /// # Errors
     ///
     /// [`ConfigError::Invalid`] naming the first problem found, prefixed with
     /// the job name so a bad job among many is easy to spot.
-    pub fn validate(&mut self) -> Result<()> {
+    pub fn validate_static(&mut self) -> Result<()> {
         self.resolve_and_validate_schedule()?;
 
         if !self.filename.contains("%Y") {
@@ -761,8 +867,77 @@ impl JobConfig {
         }
 
         self.validate_hooks()?;
+        self.storage
+            .validate_static()
+            .map_err(|err| invalid(format!("job `{}`: {err}", self.name)))?;
 
         Ok(())
+    }
+
+    /// Filesystem checks for this job: sources exist, secrets readable, Docker socket present if needed.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first missing path or unreadable file.
+    pub fn validate_runtime(&self, docker: &DockerConfig) -> Result<()> {
+        for source in &self.source {
+            if !source.exists() {
+                return Err(invalid(format!(
+                    "job `{}`: source path `{}` does not exist",
+                    self.name,
+                    source.display()
+                )));
+            }
+        }
+
+        if let StorageConfig::Sftp(cfg) = &self.storage
+            && let Some(key_path) = &cfg.key_path
+        {
+            if !key_path.exists() {
+                return Err(invalid(format!(
+                    "job `{}`: sftp key_path `{}` does not exist",
+                    self.name,
+                    key_path.display()
+                )));
+            }
+            if std::fs::File::open(key_path).is_err() {
+                return Err(invalid(format!(
+                    "job `{}`: sftp key_path `{}` is not readable",
+                    self.name,
+                    key_path.display()
+                )));
+            }
+        }
+
+        if self.needs_docker() || self.wants_stop() {
+            match &docker.socket {
+                Some(socket) if !socket.exists() => {
+                    return Err(invalid(format!(
+                        "job `{}` stops containers or runs a container hook, but Docker socket `{}` does not exist",
+                        self.name,
+                        socket.display()
+                    )));
+                }
+                None => {
+                    return Err(invalid(format!(
+                        "job `{}` stops containers or runs a container hook, but [docker] socket is not set",
+                        self.name
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Legacy validate method.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the first problem found.
+    pub fn validate(&mut self) -> Result<()> {
+        self.validate_static()
     }
 
     /// Whether this job wants containers stopped for consistency.
@@ -1598,5 +1773,91 @@ filename = "db-%Y%m%dT%H%M%SZ"
             job.schedule_source,
             Some(ScheduleSource::Crontext("every 15 minutes".to_owned()))
         );
+    }
+
+    #[test]
+    fn validate_static_accepts_nonexistent_source_and_runtime_rejects_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let non_existent = dir.path().join("definitely-does-not-exist-dir");
+        let body = format!(
+            r#"
+[[job]]
+name = "db"
+cron = "0 3 * * *"
+source = ["{}"]
+filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
+retention_days = 14
+min_keep = 3
+
+  [job.storage]
+  type = "fs"
+  root = "{}"
+"#,
+            non_existent.display(),
+            dir.path().display()
+        );
+
+        let path = write_config(dir.path(), &body);
+        let config = Config::load(&path, ValidationMode::Static)
+            .expect("validate_static must accept non-existent source dirs");
+
+        let runtime_err = config
+            .validate_runtime()
+            .expect_err("validate_runtime must reject non-existent source dirs");
+        assert!(
+            runtime_err.to_string().contains("does not exist"),
+            "{runtime_err}"
+        );
+
+        // When source dir is created, validate_runtime succeeds
+        std::fs::create_dir_all(&non_existent).expect("create source");
+        config
+            .validate_runtime()
+            .expect("validate_runtime must pass once source exists");
+    }
+
+    #[test]
+    fn job_name_rules() {
+        // Direct helper checks
+        assert!(is_valid_job_name("db"));
+        assert!(is_valid_job_name("pg-main_1"));
+        assert!(is_valid_job_name("a"));
+        assert!(is_valid_job_name("1"));
+        assert!(is_valid_job_name(&"a".repeat(63)));
+
+        assert!(!is_valid_job_name(""));
+        assert!(!is_valid_job_name("../x"));
+        assert!(!is_valid_job_name("A"));
+        assert!(!is_valid_job_name("-x"));
+        assert!(!is_valid_job_name("_x"));
+        assert!(!is_valid_job_name(&"a".repeat(64)));
+        assert!(!is_valid_job_name("job/name"));
+        assert!(!is_valid_job_name("job name"));
+        assert!(!is_valid_job_name("job\"name"));
+        assert!(!is_valid_job_name("job'name"));
+
+        // Config parsing checks
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid_body = format!("[[job]]\nname = \"pg-main_1\"\n{}\n", job_yaml());
+        assert!(parse(&valid_body, dir.path()).is_ok());
+
+        for bad in [
+            "../x",
+            "A",
+            "-x",
+            "",
+            &"a".repeat(64),
+            "job/name",
+            "job name",
+        ] {
+            let bad_body = format!("[[job]]\nname = \"{bad}\"\n{}\n", job_yaml());
+            let err =
+                parse(&bad_body, dir.path()).expect_err(&format!("accepted bad name `{bad}`"));
+            assert!(
+                err.to_string().contains("job name")
+                    || err.to_string().contains("invalid job name"),
+                "unexpected error message: {err}"
+            );
+        }
     }
 }

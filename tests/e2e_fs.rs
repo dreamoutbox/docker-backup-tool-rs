@@ -325,7 +325,7 @@ fn a_missing_source_fails_and_leaves_nothing_behind() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("archive error"),
+        stderr.contains("archive error") || stderr.contains("does not exist"),
         "unhelpful error: {stderr}"
     );
 
