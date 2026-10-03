@@ -161,6 +161,7 @@ min_keep = 3
             .expect("read remote dir")
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".sha256"))
             .collect()
     }
 
