@@ -1,0 +1,7 @@
+{
+	"image": "mcr.microsoft.com/devcontainers/rust:1-trixie",
+	"features": {
+		"ghcr.io/devcontainers/features/rust:1": {}
+	},
+	"forwardPorts": [3000, 8080, 8333, 8888, 9333]
+}
