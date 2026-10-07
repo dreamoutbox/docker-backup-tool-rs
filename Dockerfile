@@ -25,7 +25,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---- Stage 4: runtime ----
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates openssh-client tzdata \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        docker.io \
+        openssh-client \
+        postgresql-client \
+        tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/dvb /etc/dvb
 COPY --from=builder /app/target/release/dvb /usr/local/bin/dvb
