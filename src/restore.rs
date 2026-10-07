@@ -6,7 +6,6 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::TryStreamExt as _;
@@ -536,6 +535,82 @@ fn resolve_and_validate_script(
     Ok(Some(path))
 }
 
+/// A resolved restore command: the program plus the argument handling rules.
+#[derive(Debug, Clone)]
+struct ResolvedRestore {
+    /// Executable to run: a script path or `cmd[0]`.
+    program: String,
+    /// Non-target base arguments (`cmd[1..]` for a `cmd`; empty for a script).
+    base_args: Vec<String>,
+    /// Working directory for local execution.
+    dir: Option<PathBuf>,
+    /// Whether the extraction directory is injected as the first argument.
+    /// Script forms historically receive `$1 = <extract dir>`; `cmd` forms get
+    /// it through `DVB_RESTORE_DIR` instead.
+    inject_target: bool,
+}
+
+/// Resolve the restore command a restore should run: the CLI `--script`, or the
+/// job's configured restore hook (`cmd` or `script`). `None` when neither a CLI
+/// script nor a configured restore hook exists.
+fn resolve_restore_command(
+    job: &JobConfig,
+    cli_script: Option<&Path>,
+) -> Result<Option<ResolvedRestore>> {
+    // CLI `--script` takes precedence and always receives the target directory.
+    if let Some(abs) = resolve_and_validate_script(job, cli_script)? {
+        return Ok(Some(ResolvedRestore {
+            program: abs.display().to_string(),
+            base_args: Vec::new(),
+            dir: None,
+            inject_target: true,
+        }));
+    }
+
+    let Some(restore) = job.restore.as_ref() else {
+        return Ok(None);
+    };
+
+    // A configured `cmd` runs its own vector; the target is in `DVB_RESTORE_DIR`.
+    if let Some(cmd) = restore.cmd.as_deref() {
+        let Some(program) = cmd.first() else {
+            return Ok(None);
+        };
+        let base_args = cmd[1..].to_vec();
+        return Ok(Some(ResolvedRestore {
+            program: (*program).clone(),
+            base_args,
+            dir: restore.dir.clone(),
+            inject_target: false,
+        }));
+    }
+
+    // A configured `script` is validated then treated like a CLI script.
+    if let Some(abs) = resolve_and_validate_script(job, restore.script.as_deref())? {
+        return Ok(Some(ResolvedRestore {
+            program: abs.display().to_string(),
+            base_args: Vec::new(),
+            dir: restore.dir.clone(),
+            inject_target: true,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Map a shared process error onto the restore-specific error type.
+fn map_process_error(err: crate::hooks::ProcessError) -> ScriptRunError {
+    match err {
+        crate::hooks::ProcessError::TimedOut(_) => ScriptRunError::TimedOut,
+        crate::hooks::ProcessError::Cancelled => ScriptRunError::Cancelled,
+        crate::hooks::ProcessError::Wait(io) => ScriptRunError::Io(io),
+        crate::hooks::ProcessError::Spawn(message)
+        | crate::hooks::ProcessError::Docker(message) => {
+            ScriptRunError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+        }
+    }
+}
+
 /// Validate `--stop-containers` requirements before downloading anything.
 fn validate_stop_containers(
     job: &JobConfig,
@@ -566,69 +641,80 @@ fn validate_stop_containers(
 enum ScriptRunError {
     Cancelled,
     TimedOut,
-    Failed(i32),
+    Failed(i64),
     Io(std::io::Error),
 }
 
-async fn run_script_process(
-    script_path: &Path,
-    extracted_dir: &Path,
-    backup: &Backup,
-    job: &JobConfig,
-    extra_args: &[String],
+/// Everything a single restore process run needs, passed as one value so the
+/// runner's signature stays small.
+struct RestoreProcessSpec<'a> {
+    command: &'a crate::hooks::Command,
+    target: &'a Path,
+    backup: &'a Backup,
+    job: &'a JobConfig,
+    extra_args: &'a [String],
     timeout_secs: u64,
-    shutdown: &Shutdown,
-) -> std::result::Result<(), ScriptRunError> {
-    let mut child = tokio::process::Command::new(script_path)
-        .arg(extracted_dir)
-        .args(extra_args)
-        .envs([
-            ("DVB_JOB", job.name.as_str()),
-            ("DVB_RESTORE_DIR", extracted_dir.to_str().unwrap_or("")),
-            ("DVB_ARCHIVE", backup.path.as_str()),
-            ("DVB_ARCHIVE_TIME", backup.timestamp.to_rfc3339().as_str()),
-        ])
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(ScriptRunError::Io)?;
+    shutdown: &'a Shutdown,
+    container: Option<&'a str>,
+    docker_socket: Option<&'a Path>,
+}
 
-    let stdout = tokio::spawn(crate::hooks::pump(child.stdout.take(), "stdout"));
-    let stderr = tokio::spawn(crate::hooks::pump(child.stderr.take(), "stderr"));
+async fn run_restore_process(spec: RestoreProcessSpec<'_>) -> std::result::Result<(), ScriptRunError> {
+    let env: Vec<(String, String)> = [
+        ("DVB_JOB", spec.job.name.as_str()),
+        ("DVB_RESTORE_DIR", spec.target.to_str().unwrap_or("")),
+        ("DVB_ARCHIVE", spec.backup.path.as_str()),
+        ("DVB_ARCHIVE_TIME", spec.backup.timestamp.to_rfc3339().as_str()),
+    ]
+    .iter()
+    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+    .collect();
 
-    let outcome = tokio::select! {
-        wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => {
-            match wait_res {
-                Ok(Ok(status)) => {
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        Err(ScriptRunError::Failed(status.code().unwrap_or(-1)))
-                    }
-                }
-                Ok(Err(err)) => Err(ScriptRunError::Io(err)),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    Err(ScriptRunError::TimedOut)
-                }
-            }
-        }
-        () = shutdown.cancelled() => {
-            let _ = child.kill().await;
-            Err(ScriptRunError::Cancelled)
-        }
+    // Extra CLI `--` arguments ride along behind the command's own arguments.
+    let args: Vec<String> = spec
+        .command
+        .args
+        .iter()
+        .chain(spec.extra_args.iter())
+        .map(String::clone)
+        .collect();
+    let with_extra = crate::hooks::Command {
+        program: spec.command.program.clone(),
+        args,
+        dir: spec.command.dir.clone(),
     };
 
-    crate::hooks::drain(stdout).await;
-    crate::hooks::drain(stderr).await;
+    let code = if let Some(container) = spec.container {
+        let socket = spec.docker_socket.ok_or_else(|| {
+            ScriptRunError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "restore runs in a container, but [docker].socket is not configured",
+            ))
+        })?;
+        let client = docker::Client::connect(socket).map_err(|err| {
+            ScriptRunError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cannot reach docker: {err}"),
+            ))
+        })?;
+        crate::hooks::run_container(&with_extra, &env, spec.timeout_secs, container, &client)
+            .await
+            .map_err(map_process_error)?
+    } else {
+        crate::hooks::run_local(&with_extra, &env, spec.timeout_secs, Some(spec.shutdown))
+            .await
+            .map_err(map_process_error)?
+    };
 
-    outcome
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(ScriptRunError::Failed(code))
+    }
 }
 
 async fn execute_restore_hook(
-    script_path: &Path,
+    resolved: ResolvedRestore,
     target_path: &Path,
     backup: &Backup,
     job: &JobConfig,
@@ -638,7 +724,7 @@ async fn execute_restore_hook(
 ) -> Result<u8> {
     let timeout_secs = options
         .script_timeout
-        .or_else(|| job.restore.as_ref().map(|r| r.script_timeout_secs))
+        .or_else(|| job.restore.as_ref().map(|r| r.timeout_secs))
         .unwrap_or(3600);
 
     let stop_guard = if options.stop_containers {
@@ -653,15 +739,31 @@ async fn execute_restore_hook(
         None
     };
 
-    let script_res = run_script_process(
-        script_path,
-        target_path,
+    // Script forms receive the extraction target as their first argument
+    // (`$1 = <dir>`); `cmd` forms get it through `DVB_RESTORE_DIR`.
+    let mut args: Vec<String> = Vec::new();
+    if resolved.inject_target {
+        args.push(target_path.display().to_string());
+    }
+    args.extend(resolved.base_args.iter().cloned());
+    let command = crate::hooks::Command {
+        program: resolved.program,
+        args,
+        dir: resolved.dir,
+    };
+
+    let container = job.restore.as_ref().and_then(|r| r.container.as_deref());
+    let script_res = run_restore_process(RestoreProcessSpec {
+        command: &command,
+        target: target_path,
         backup,
         job,
-        &options.extra_args,
+        extra_args: &options.extra_args,
         timeout_secs,
         shutdown,
-    )
+        container,
+        docker_socket,
+    })
     .await;
 
     if let Some(guard) = stop_guard
@@ -736,7 +838,7 @@ pub async fn run_restore(
     let _lock = JobLock::try_acquire(&job.name)?;
 
     // 2. Early validations before any storage operations.
-    let validated_script = resolve_and_validate_script(job, options.script.as_deref())?;
+    let resolved_command = resolve_restore_command(job, options.script.as_deref())?;
     validate_stop_containers(job, options.stop_containers, docker_socket)?;
 
     // 3. List backups and select the target backup.
@@ -767,9 +869,9 @@ pub async fn run_restore(
 
     // 5. Dry-run: print resolved details and exit early without downloading.
     if options.dry_run {
-        let script_display = validated_script
+        let script_display = resolved_command
             .as_ref()
-            .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+            .map_or_else(|| "none".to_owned(), |r| r.program.clone());
         println!("job: {}", job.name);
         println!("backup: {}", backup.path);
         println!("size: {} bytes", backup.size);
@@ -797,10 +899,10 @@ pub async fn run_restore(
     let target_path =
         promote_or_cleanup_staging(extract_result, &abs_target_dir, staging_dir.as_deref())?;
 
-    // 10. Execute script hook (or handle --stop-containers if no script).
-    let exit_code = if let Some(ref script_path) = validated_script {
+    // 10. Execute the restore hook (or handle --stop-containers if none).
+    let exit_code = if let Some(resolved) = resolved_command {
         execute_restore_hook(
-            script_path,
+            resolved,
             &target_path,
             backup,
             job,
@@ -1165,10 +1267,12 @@ mod tests {
         );
 
         // 3. No script, job.restore.dir configured -> default to job.restore.dir
-        job.restore = Some(crate::config::RestoreConfig {
+        job.restore = Some(crate::config::RestoreHookConfig {
             dir: Some(PathBuf::from("/configured/restore")),
             script: None,
-            script_timeout_secs: 3600,
+            cmd: Some(vec!["/scripts/pg_restore.sh".to_owned()]),
+            container: None,
+            timeout_secs: 3600,
         });
         let res = resolve_target_dir(&job, None, None, time).unwrap();
         assert_eq!(res, PathBuf::from("/configured/restore"));
@@ -1195,6 +1299,70 @@ mod tests {
 
         // Passes with force
         assert!(validate_target_dir(dir.path(), true).is_ok());
+    }
+
+    #[test]
+    fn resolve_restore_command_supports_cmd_and_script_forms() {
+        let mut job = test_job();
+
+        // None when neither a CLI script nor a configured restore hook exists.
+        assert!(resolve_restore_command(&job, None).unwrap().is_none());
+
+        // A configured `cmd` resolves its first element as the program.
+        job.restore = Some(crate::config::RestoreHookConfig {
+            dir: Some(PathBuf::from("/restore")),
+            script: None,
+            cmd: Some(vec!["pg_restore".to_owned(), "-d".to_owned(), "db".to_owned()]),
+            container: None,
+            timeout_secs: 60,
+        });
+        let Some(resolved) = resolve_restore_command(&job, None).unwrap() else {
+            panic!("cmd restore should resolve");
+        };
+        assert_eq!(resolved.program, "pg_restore");
+        assert_eq!(resolved.base_args, vec!["-d".to_owned(), "db".to_owned()]);
+        assert!(!resolved.inject_target, "cmd restore should not inject the target arg");
+        assert_eq!(resolved.dir.as_deref(), Some(Path::new("/restore")));
+    }
+
+    #[tokio::test]
+    async fn restore_cmd_runs_locally_with_target_env() {
+        let marker = tempfile::tempdir().expect("tempdir");
+        let written = marker.path().join("seen");
+        let target = marker.path().join("extracted");
+        std::fs::create_dir_all(&target).expect("mkdir");
+
+        let job = test_job();
+        let backup = Backup {
+            path: "db/db-20261001T100000Z.tar.zst".to_owned(),
+            size: 1,
+            timestamp: Utc.with_ymd_and_hms(2026, 10, 1, 10, 0, 0).unwrap(),
+        };
+        let command = crate::hooks::Command {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                format!("printf '%s:%s' \"$1\" \"$DVB_RESTORE_DIR\" > {}\n", written.display()),
+            ],
+            dir: None,
+        };
+
+        let script_res = run_restore_process(RestoreProcessSpec {
+            command: &command,
+            target: &target,
+            backup: &backup,
+            job: &job,
+            extra_args: &[],
+            timeout_secs: 30,
+            shutdown: &Shutdown::new(),
+            container: None,
+            docker_socket: None,
+        })
+        .await;
+        script_res.expect("restore cmd should succeed");
+
+        let seen = std::fs::read_to_string(&written).expect("marker");
+        assert_eq!(seen.trim(), format!(":{}", target.display()));
     }
 
     fn craft_raw_tar(path_bytes: &[u8], data: &[u8]) -> Vec<u8> {

@@ -154,11 +154,24 @@ pub struct HookSummary {
 }
 
 impl HookSummary {
+    /// The program a hook runs: `cmd[0]` or its script path.
+    fn program(hook: &HookConfig) -> Vec<String> {
+        if let Some(cmd) = &hook.cmd
+            && let Some(program) = cmd.first()
+        {
+            vec![(*program).clone()]
+        } else if let Some(script) = &hook.script {
+            vec![script.display().to_string()]
+        } else {
+            vec![]
+        }
+    }
+
     /// Build a pre-hook summary. Pre-hooks do not specify `run_on`.
     #[must_use]
     pub fn from_pre_hook(hook: &HookConfig) -> Self {
         Self {
-            cmd: hook.cmd.first().cloned().into_iter().collect(),
+            cmd: Self::program(hook),
             container: hook.container.clone(),
             timeout_secs: hook.timeout_secs,
             run_on: None,
@@ -169,7 +182,7 @@ impl HookSummary {
     #[must_use]
     pub fn from_post_hook(hook: &HookConfig) -> Self {
         Self {
-            cmd: hook.cmd.first().cloned().into_iter().collect(),
+            cmd: Self::program(hook),
             container: hook.container.clone(),
             timeout_secs: hook.timeout_secs,
             run_on: Some(hook.run_on),
@@ -290,7 +303,8 @@ mod tests {
                 force_path_style: true,
             }),
             pre: vec![HookConfig {
-                cmd: vec!["dump.sh".to_owned(), hook_arg.to_owned()],
+                cmd: Some(vec!["dump.sh".to_owned(), hook_arg.to_owned()]),
+                script: None,
                 run_on: RunOn::Success,
                 container: None,
                 timeout_secs: 30,

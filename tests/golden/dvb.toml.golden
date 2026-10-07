@@ -51,7 +51,7 @@ min_keep = 3
 ## optional: Default restore script to execute after extraction.
 # script = "/scripts/pg_restore.sh"
 ## optional: Timeout in seconds for the restore script.
-# script_timeout_secs = 3600
+# timeout_secs = 3600
 
 ## optional: Pre-backup hook executed before archiving.
 # [[job.pre]]

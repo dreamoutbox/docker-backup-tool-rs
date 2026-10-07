@@ -3,13 +3,14 @@
 Redesign the configuration TOML schema to use `[job.<job_name>]` tables, explicit hook names (`pre_backup`, `post_backup`, `pre_restore`, `post_restore`), containerized or local `cmd`/`script` execution, and a unified `timeout_secs` across hooks.
 
 ### Phase 1: Core Hook Schema & Execution Engine
+- Status: DONE
 - Goal: Unify hook configuration types and execution logic to support `script` or `cmd`, container or local execution, and unified `timeout_secs`.
 - Tasks:
-  - [ ] Define updated `HookConfig` and `RestoreHookConfig` structs with `container: Option<String>`, `timeout_secs: u64`, `script: Option<PathBuf>`, `cmd: Option<Vec<String>>`, and optional `dir: Option<PathBuf>` for restore.
-  - [ ] Update `src/hooks.rs` execution engine to handle both `cmd` (arg vector) and `script` (executable file path), dispatching via Docker exec (`client.exec`) when `container` is set or local process (`tokio::process::Command`) when `container` is `None`.
-  - [ ] Update `src/restore.rs` hook execution to support containerized execution (Docker exec into target container) and local execution for both `script` and `cmd`, driven by `timeout_secs`.
-  - [ ] Add hook validation ensuring exactly one of `cmd` or `script` is configured, arguments are non-empty, and `timeout_secs >= 1`.
-  - [ ] Add unit tests in `src/hooks.rs` and `src/restore.rs` for unified execution paths.
+  - [x] Define updated `HookConfig` and `RestoreHookConfig` structs with `container: Option<String>`, `timeout_secs: u64`, `script: Option<PathBuf>`, `cmd: Option<Vec<String>>`, and optional `dir: Option<PathBuf>` for restore.
+  - [x] Update `src/hooks.rs` execution engine to handle both `cmd` (arg vector) and `script` (executable file path), dispatching via Docker exec (`client.exec`) when `container` is set or local process (`tokio::process::Command`) when `container` is `None`.
+  - [x] Update `src/restore.rs` hook execution to support containerized execution (Docker exec into target container) and local execution for both `script` and `cmd`, driven by `timeout_secs`.
+  - [x] Add hook validation ensuring exactly one of `cmd` or `script` is configured, arguments are non-empty, and `timeout_secs >= 1`.
+  - [x] Add unit tests in `src/hooks.rs` and `src/restore.rs` for unified execution paths.
 - Done when: `cargo nextest run --test-threads 1 --fail-fast -p dvb hooks` and `restore` tests pass.
 
 ### Phase 2: Job Table Mapping & Explicit Hook Integration

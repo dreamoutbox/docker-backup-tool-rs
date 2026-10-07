@@ -206,24 +206,36 @@ pub struct JobConfig {
 
     /// Optional defaults for `dvb restore <job>`.
     #[serde(default)]
-    pub restore: Option<RestoreConfig>,
+    pub restore: Option<RestoreHookConfig>,
 }
 
-/// Optional default settings for restoring a job's backup.
+/// Optional default restore hook for a job.
+///
+/// Exactly one of `cmd` or `script` is required to perform a restore where a
+/// hook is configured; `dir` gives the default extraction target and
+/// `container` moves execution into a running container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RestoreConfig {
-    /// Default extraction target directory when no script is specified.
+pub struct RestoreHookConfig {
+    /// Default extraction target directory when no `--to` is passed.
     #[serde(default)]
     pub dir: Option<PathBuf>,
 
-    /// Optional default restore script to execute.
+    /// Executable file run after extraction. Mutually exclusive with `cmd`.
     #[serde(default)]
     pub script: Option<PathBuf>,
 
-    /// Timeout in seconds for the restore script.
+    /// Argument vector run after extraction. Mutually exclusive with `script`.
+    #[serde(default)]
+    pub cmd: Option<Vec<String>>,
+
+    /// Container to run the restore in; `None` runs it locally.
+    #[serde(default)]
+    pub container: Option<String>,
+
+    /// Timeout in seconds for the restore step.
     #[serde(default = "default_script_timeout")]
-    pub script_timeout_secs: u64,
+    pub timeout_secs: u64,
 }
 
 const fn default_script_timeout() -> u64 {
@@ -299,11 +311,20 @@ impl Compression {
 }
 
 /// A pre or post hook.
+///
+/// Exactly one of `cmd` (an argument vector) or `script` (an executable file)
+/// must be configured; validation enforces that. Either can run locally or
+/// inside a container when `container` is set.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
-    /// Argument vector, executed without a shell.
-    pub cmd: Vec<String>,
+    /// Argument vector, executed without a shell. Mutually exclusive with `script`.
+    #[serde(default)]
+    pub cmd: Option<Vec<String>>,
+
+    /// Path to an executable file, run directly. Mutually exclusive with `cmd`.
+    #[serde(default)]
+    pub script: Option<PathBuf>,
 
     /// When this hook should run (only meaningful for post hooks).
     #[serde(default)]
@@ -316,6 +337,20 @@ pub struct HookConfig {
     /// Seconds before the hook is killed.
     #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u64,
+}
+
+impl HookConfig {
+    /// Human-readable form of what the hook runs, for logs and CI checks.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if let Some(cmd) = &self.cmd {
+            cmd.join(" ")
+        } else if let Some(script) = &self.script {
+            script.display().to_string()
+        } else {
+            "<no command>".to_owned()
+        }
+    }
 }
 
 const fn default_hook_timeout() -> u64 {
@@ -795,28 +830,75 @@ impl JobConfig {
         Ok(())
     }
 
+    fn validate_one_hook(&self, label: &str, hook: &HookConfig) -> Result<()> {
+        if hook.cmd.is_some() == hook.script.is_some() {
+            return Err(invalid(format!(
+                "job `{}`: {label} must configure exactly one of `cmd` or `script`",
+                self.name
+            )));
+        }
+        if let Some(cmd) = &hook.cmd {
+            if cmd.is_empty() {
+                return Err(invalid(format!(
+                    "job `{}`: {label} has an empty cmd",
+                    self.name
+                )));
+            }
+            if cmd.iter().any(String::is_empty) {
+                return Err(invalid(format!(
+                    "job `{}`: {label} has an empty argument",
+                    self.name
+                )));
+            }
+        }
+        if hook.timeout_secs == 0 {
+            return Err(invalid(format!(
+                "job `{}`: {label} timeout_secs must be >= 1",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_hooks(&self) -> Result<()> {
         for (phase, hooks) in [("pre", &self.pre), ("post", &self.post)] {
             for (index, hook) in hooks.iter().enumerate() {
-                if hook.cmd.is_empty() {
-                    return Err(invalid(format!(
-                        "job `{}`: {phase} hook #{index} has an empty cmd",
-                        self.name
-                    )));
-                }
-                if hook.cmd.iter().any(String::is_empty) {
-                    return Err(invalid(format!(
-                        "job `{}`: {phase} hook #{index} has an empty argument",
-                        self.name
-                    )));
-                }
-                if hook.timeout_secs == 0 {
-                    return Err(invalid(format!(
-                        "job `{}`: {phase} hook #{index} timeout_secs must be >= 1",
-                        self.name
-                    )));
-                }
+                let label = format!("{phase} hook #{index}");
+                self.validate_one_hook(label.as_str(), hook)?;
             }
+        }
+        if let Some(restore) = &self.restore {
+            self.validate_restore_hook(restore)?;
+        }
+        Ok(())
+    }
+
+    fn validate_restore_hook(&self, restore: &RestoreHookConfig) -> Result<()> {
+        if restore.script.is_some() == restore.cmd.is_some() {
+            return Err(invalid(format!(
+                "job `{}`: restore must configure exactly one of `cmd` or `script`",
+                self.name
+            )));
+        }
+        if let Some(cmd) = &restore.cmd {
+            if cmd.is_empty() {
+                return Err(invalid(format!(
+                    "job `{}`: restore has an empty cmd",
+                    self.name
+                )));
+            }
+            if cmd.iter().any(String::is_empty) {
+                return Err(invalid(format!(
+                    "job `{}`: restore has an empty argument",
+                    self.name
+                )));
+            }
+        }
+        if restore.timeout_secs == 0 {
+            return Err(invalid(format!(
+                "job `{}`: restore timeout_secs must be >= 1",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -1586,7 +1668,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
   [job.restore]
   dir = "/restore"
   script = "/scripts/pg_restore.sh"
-  script_timeout_secs = 1800
+  timeout_secs = 1800
 "#;
         let config = parse(body, dir.path()).unwrap();
         let restore = config.jobs[0].restore.as_ref().expect("restore configured");
@@ -1595,7 +1677,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
             restore.script.as_deref(),
             Some(Path::new("/scripts/pg_restore.sh"))
         );
-        assert_eq!(restore.script_timeout_secs, 1800);
+        assert_eq!(restore.timeout_secs, 1800);
     }
 
     #[test]

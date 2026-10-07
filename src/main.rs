@@ -442,7 +442,7 @@ async fn check_containers(client: Option<&docker::Client>, job: &JobConfig) -> u
         let Some(container) = hook.container.as_deref() else {
             continue;
         };
-        let label = format!("{phase} hook `{}`", hook.cmd.join(" "));
+        let label = format!("{phase} hook `{}`", hook.describe());
         let timeout = Duration::from_secs(hook.timeout_secs.min(30));
 
         match client.resolve(&[container.to_owned()], None).await {
