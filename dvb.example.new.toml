@@ -1,0 +1,63 @@
+[docker]
+socket = "/var/run/docker.sock"
+
+[job.db]
+cron = "0 3 * * *"                         # Every day at 03:00 UTC
+run_on_start = true                        # Take an initial backup when the daemon starts
+source = ["/backup/pgdump"]
+filename = "pgdump-%Y%m%dT%H%M%SZ.tar.zst"
+compression = "zstd"
+retention_days = 14
+min_keep = 3
+
+[job.db.storage]
+type = "dropbox"
+root = "/backups"
+client_id = "dropbox_client_id"
+client_secret = "dropbox_client_secret"
+refresh_token = "dropbox_refresh_token"
+
+# Pre-backup hook: dvb runs pg_dump via `docker exec` inside the 'db' container.
+# Output goes directly to /backup/pgdump/dump.sql on the shared staging volume.
+# No docker CLI or external tools needed in the dvb container itself.
+[job.db.pre_backup]
+# container to execute command/script
+container = "db"
+# timeout execute command/script
+timeout_secs = 3600
+# Run script
+script = "/scripts/pg_restore.sh"
+# OR run cmd
+cmd = [
+    "pg_dump",
+    "-U",
+    "postgres",
+    "-d",
+    "app",
+    "--clean",
+    "--if-exists",
+    "-f",
+    "/backup/pgdump/dump.sql",
+]
+
+[job.db.post_restore]
+# container to execute command/script
+container = "db"
+# restore to dir
+dir = "/backup"
+# timeout execute command/script
+timeout_secs = 3600
+# Run script
+script = "/scripts/pg_restore.sh"
+# OR run cmd
+cmd = [
+    "pg_restore",
+    "-U",
+    "postgres",
+    "-d",
+    "app",
+    "--clean",
+    "--if-exists",
+    "-f",
+    "/backup/pgdump/dump.sql",
+]
