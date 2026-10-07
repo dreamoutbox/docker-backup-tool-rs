@@ -324,7 +324,7 @@ async fn check(global: &GlobalArgs) -> error::Result<u8> {
 
         failures += check_containers(docker.as_ref(), job).await;
 
-        if let Some(restore) = &job.restore
+        if let Some(restore) = &job.post_restore
             && let Some(dir) = &restore.dir
         {
             check_restore_dir(dir);
@@ -409,12 +409,13 @@ async fn check_socket(socket: Option<&Path>) -> (Option<docker::Client>, usize) 
 ///
 /// Returns how many checks failed.
 async fn check_containers(client: Option<&docker::Client>, job: &JobConfig) -> usize {
-    let hooks = job
-        .pre
-        .iter()
-        .map(|hook| ("pre", hook))
-        .chain(job.post.iter().map(|hook| ("post", hook)))
-        .filter(|(_, hook)| hook.container.is_some());
+    let hooks = [
+        ("pre", job.pre_backup.as_ref()),
+        ("post", job.post_backup.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(phase, hook)| hook.map(|hook| (phase, hook)))
+    .filter(|(_, hook)| hook.container.is_some());
 
     if !job.needs_docker() {
         return 0;
@@ -442,7 +443,7 @@ async fn check_containers(client: Option<&docker::Client>, job: &JobConfig) -> u
         let Some(container) = hook.container.as_deref() else {
             continue;
         };
-        let label = format!("{phase} hook `{}`", hook.cmd.join(" "));
+        let label = format!("{phase} hook `{}`", hook.describe());
         let timeout = Duration::from_secs(hook.timeout_secs.min(30));
 
         match client.resolve(&[container.to_owned()], None).await {
@@ -586,7 +587,7 @@ mod tests {
             .expect("runtime")
             .block_on(dispatch(&cli))
             .unwrap_err();
-        assert!(format!("{err:#}").contains("no [[job]] defined"));
+        assert!(format!("{err:#}").contains("no [job.<name>] defined"));
     }
 
     #[test]

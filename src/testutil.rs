@@ -39,10 +39,11 @@ impl JobBuilder {
                     root: PathBuf::from("/tmp/dvb-test"),
                     prefix: "db".to_owned(),
                 }),
-                pre: Vec::new(),
-                post: Vec::new(),
+                pre_backup: None,
+                post_backup: None,
                 run_on_start: false,
-                restore: None,
+                pre_restore: None,
+                post_restore: None,
             },
         }
     }

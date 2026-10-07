@@ -155,9 +155,7 @@ mod tests {
         assert_eq!(job.cron.as_deref(), Some("0 3 * * *"));
         assert_eq!(
             job.schedule_source,
-            Some(crate::config::ScheduleSource::Crontext(
-                "every day at 03:00".to_owned()
-            ))
+            Some(crate::config::ScheduleSource::Cron)
         );
         assert_eq!(job.filename, "backup-%Y%m%dT%H%M%SZ.tar.zst");
     }
@@ -181,8 +179,19 @@ mod tests {
                 in_alt_storage = false;
             }
 
-            // Skip alternative cron line since crontext is active
-            if line.trim() == "# cron = \"0 3 * * *\"" {
+            // Skip the optional crontext: the active schedule is `cron`, and a
+            // job must configure exactly one of the two.
+            if line.trim() == "# crontext = \"every day at 03:00\"" {
+                lines.push(line.to_owned());
+                continue;
+            }
+
+            // Skip the alternate `script` under each hook: a hook must configure
+            // exactly one of `cmd` or `script`.
+            if line.trim() == "# script = \"/scripts/backup.sh\""
+                || line.trim() == "# script = \"/scripts/notify.sh\""
+                || line.trim() == "# script = \"/scripts/pg_restore.sh\""
+            {
                 lines.push(line.to_owned());
                 continue;
             }
@@ -201,14 +210,16 @@ mod tests {
         let job = &config.jobs[0];
         assert_eq!(job.timezone.as_deref(), Some("Europe/Berlin"));
         assert_eq!(job.stop_containers, vec!["postgres".to_string()]);
-        assert_eq!(job.pre.len(), 1);
-        assert_eq!(job.post.len(), 1);
+        assert!(job.pre_backup.is_some());
+        assert!(job.post_backup.is_some());
+        assert!(job.pre_restore.is_some());
+        assert!(job.post_restore.is_some());
     }
 
     #[test]
     fn alternative_storage_fs_stays_valid() {
         let fs_block = r#"
-  [job.storage]
+  [job.backup.storage]
   type = "fs"
   root = "/backup/storage"
   prefix = "backups"
@@ -224,7 +235,7 @@ mod tests {
     #[test]
     fn alternative_storage_sftp_stays_valid() {
         let sftp_block = r#"
-  [job.storage]
+  [job.backup.storage]
   type = "sftp"
   endpoint = "sftp.example.com:22"
   user = "backupuser"
@@ -243,7 +254,7 @@ mod tests {
     #[test]
     fn alternative_storage_dropbox_stays_valid() {
         let dropbox_block = r#"
-  [job.storage]
+  [job.backup.storage]
   type = "dropbox"
   root = "/backups"
   client_id = "/run/secrets/dropbox_client_id"
@@ -284,7 +295,7 @@ mod tests {
         let mut in_active_storage = false;
 
         for line in template.lines() {
-            if line.trim() == "[job.storage]" {
+            if line.trim() == "[job.backup.storage]" {
                 in_active_storage = true;
                 lines.push(new_storage.to_owned());
                 continue;

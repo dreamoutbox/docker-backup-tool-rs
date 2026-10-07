@@ -99,8 +99,7 @@ impl SeaweedS3 {
             dir.join("config.toml"),
             format!(
                 r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["{}"]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
@@ -108,7 +107,7 @@ compression = "zstd"
 retention_days = 14
 min_keep = 2
 
-  [job.storage]
+  [job.db.storage]
   type = "s3"
   bucket = "{BUCKET}"
   region = "us-east-1"

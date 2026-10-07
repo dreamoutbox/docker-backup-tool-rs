@@ -14,11 +14,11 @@ dvb restore <job> [OPTIONS] [-- <extra-script-args>...]
 
 | Flag | Description | Default |
 |---|---|---|
-| `--to <DIR>` | Explicit directory to extract into | `job.restore.dir` (or temporary staging dir if script is used) |
+| `--to <DIR>` | Explicit directory to extract into | `job.<name>.post_restore.dir` (or temporary staging dir if script is used) |
 | `--name <NAME>` | Exact backup object name to restore | Newest backup |
 | `--at <TIMESTAMP>` | Target cutoff timestamp (RFC3339 or `YYYY-MM-DD` end of day) | Newest backup |
-| `--script <PATH>` | Path to a restore script hook to execute after extraction | `job.restore.script` (if configured) |
-| `--script-timeout <SECS>` | Timeout in seconds for the restore script hook | `job.restore.script_timeout_secs` or 3600 |
+| `--script <PATH>` | Path to a restore script hook to execute after extraction | `job.<name>.post_restore.script` (if configured) |
+| `--script-timeout <SECS>` | Timeout in seconds for the restore script hook | `job.<name>.post_restore.timeout_secs` or 3600 |
 | `--force` | Extract into an existing non-empty directory | `false` |
 | `--cleanup` | Delete the temporary extracted directory after a successful script hook | `false` |
 | `--stop-containers` | Stop job containers before the restore script runs, and restart them after | `false` |
@@ -31,22 +31,21 @@ dvb restore <job> [OPTIONS] [-- <extra-script-args>...]
 
 ## Configuration (`config.toml`)
 
-You can define default restore behavior for a job under `[job.restore]`:
+You can define the default post-restore behavior for a job under `[job.<name>.post_restore]`:
 
 ```toml
-[[job]]
-name = "db"
+[job.db]
 source = ["/var/lib/postgresql/data"]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
 stop_containers = ["postgres-prod"]
 
-  [job.restore]
+  [job.db.post_restore]
   # Default directory when restoring without a script and without --to
   dir = "/mnt/restores/db"
   # Default script hook to execute
   script = "/usr/local/bin/pg_restore.sh"
-  # Script timeout in seconds
-  script_timeout_secs = 1800
+  # Step timeout in seconds
+  timeout_secs = 1800
 ```
 
 ---
@@ -75,7 +74,7 @@ stop_containers = ["postgres-prod"]
 
 ## Script Hooks
 
-When `--script` or `[job.restore].script` is specified:
+When `--script` or `[job.<name>.post_restore].script` is specified:
 
 1. **Invocation:** The script is called directly without a shell:
    ```sh

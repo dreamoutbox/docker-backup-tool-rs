@@ -55,8 +55,7 @@ impl Fixture {
 [docker]
 socket = "{}"
 
-[[job]]
-name = "{JOB}"
+[job.db]
 cron = "0 3 * * *"
 source = [{}]
 filename = "db-%Y%m%dT%H%M%SZ.tar.zst"
@@ -64,7 +63,7 @@ retention_days = 14
 min_keep = 3
 {stop_toml}
 {extra}
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = {}
   prefix = "backups"
@@ -375,7 +374,7 @@ async fn a_failing_container_hook_aborts_before_anything_is_stopped() {
     let body = body.replace(
         &format!("stop_containers = [\"{id}\"]"),
         &format!(
-            "stop_containers = [\"{id}\"]\n  [[job.pre]]\n  cmd = [\"sh\", \"-c\", \"exit 4\"]\n  container = \"{id}\""
+            "stop_containers = [\"{id}\"]\n  [job.{JOB}.pre_backup]\n  cmd = [\"sh\", \"-c\", \"exit 4\"]\n  container = \"{id}\""
         ),
     );
     std::fs::write(&fixture.config, body).expect("write config");
@@ -414,7 +413,7 @@ async fn a_container_hook_writes_through_the_daemon() {
     let body = body.replace(
         &format!("stop_containers = [\"{id}\"]"),
         &format!(
-            "stop_containers = [\"{id}\"]\n  [[job.pre]]\n  cmd = [\"sh\", \"-c\", \"touch /tmp/dvb-hook\"]\n  container = \"{id}\""
+            "stop_containers = [\"{id}\"]\n  [job.{JOB}.pre_backup]\n  cmd = [\"sh\", \"-c\", \"touch /tmp/dvb-hook\"]\n  container = \"{id}\""
         ),
     );
     std::fs::write(&fixture.config, body).expect("write config");
@@ -443,6 +442,137 @@ async fn a_container_hook_writes_through_the_daemon() {
         before,
         "the container was never stopped around the archive"
     );
+}
+
+/// Write an executable shell script into a running container via `docker exec`,
+/// returning its exit code.
+async fn write_container_script(id: &str, path: &str, body: &str) -> i64 {
+    let client = dvb::docker::Client::connect_default().expect("connect to docker");
+    let cmd = format!("cat > {path} <<'DVB' \n{body}\nDVB\nchmod +x {path}");
+    client
+        .exec(
+            id,
+            &[String::from("sh"), String::from("-c"), cmd],
+            &[],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("exec into container to write script")
+}
+
+/// Whether a marker file exists inside a running container.
+async fn marker_exists(id: &str, path: &str) -> bool {
+    let client = dvb::docker::Client::connect_default().expect("connect to docker");
+    let probe = [String::from("test"), String::from("-f"), path.to_owned()];
+    matches!(
+        client.exec(id, &probe, &[], Duration::from_secs(30)).await,
+        Ok(0)
+    )
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_container_pre_backup_script_runs() {
+    let container = sleeper().await;
+    let id = container.id().to_owned();
+    // Create an executable script inside the container that drops a marker.
+    let code = write_container_script(
+        &id,
+        "/tmp/probe.sh",
+        "#!/bin/sh\ntouch /tmp/dvb-pre-script-hook\n",
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "could not install the probe script in the container"
+    );
+
+    let extra = format!(
+        "\n  [job.{JOB}.pre_backup]\n  script = \"/tmp/probe.sh\"\n  container = \"{id}\"\n  timeout_secs = 30\n"
+    );
+    let fixture = Fixture::with_extra("", &extra);
+
+    let out = fixture.backup();
+    assert!(
+        out.status.success(),
+        "backup failed: {}",
+        Fixture::stderr_of(&out)
+    );
+
+    assert!(
+        marker_exists(&id, "/tmp/dvb-pre-script-hook").await,
+        "the pre_backup script did not run inside the container"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_container_post_restore_cmd_runs() {
+    let container = sleeper().await;
+    let id = container.id().to_owned();
+    let extra = format!(
+        "\n  [job.{JOB}.post_restore]\n  cmd = [\"sh\", \"-c\", \"touch /tmp/dvb-restore-cmd-hook\"]\n  container = \"{id}\"\n  timeout_secs = 30\n"
+    );
+    let fixture = Fixture::with_extra("", &extra);
+    fixture.write_payload("data.txt", 1);
+    assert!(fixture.backup().status.success(), "backup must succeed");
+
+    let target = fixture.path().join("restore_cmd_target");
+    let res = fixture.restore(&["--to", &target.display().to_string()]);
+    assert!(
+        res.status.success(),
+        "restore failed: stderr={}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(
+        marker_exists(&id, "/tmp/dvb-restore-cmd-hook").await,
+        "the post_restore cmd did not run inside the container"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_container_post_restore_script_runs() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let container = sleeper().await;
+    let id = container.id().to_owned();
+
+    // A restore `script` path is resolved and validated on the host before it
+    // runs, so the executable must exist both there and (for a container hook)
+    // at the same absolute path inside the target container.
+    let body = "#!/bin/sh\ntouch /tmp/dvb-restore-script-hook\n";
+    let host_script =
+        std::env::temp_dir().join(format!("dvb-restore-probe-{}.sh", std::process::id()));
+    std::fs::write(&host_script, body).expect("write host script");
+    std::fs::set_permissions(&host_script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod host script");
+    let script_str = host_script.display().to_string();
+    let code = write_container_script(&id, &script_str, body).await;
+    assert_eq!(
+        code, 0,
+        "could not install the restore probe script in the container"
+    );
+
+    let extra = format!(
+        "\n  [job.{JOB}.post_restore]\n  script = \"{script_str}\"\n  container = \"{id}\"\n  timeout_secs = 30\n"
+    );
+    let fixture = Fixture::with_extra("", &extra);
+    fixture.write_payload("data.txt", 1);
+    assert!(fixture.backup().status.success(), "backup must succeed");
+
+    let target = fixture.path().join("restore_script_target");
+    let res = fixture.restore(&["--to", &target.display().to_string()]);
+    assert!(
+        res.status.success(),
+        "restore failed: stderr={}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(
+        marker_exists(&id, "/tmp/dvb-restore-script-hook").await,
+        "the post_restore script did not run inside the container"
+    );
+    let _ = std::fs::remove_file(&host_script);
 }
 
 #[tokio::test]

@@ -57,7 +57,7 @@ services:
     image: chrislusf/seaweedfs:latest
     container_name: s3
     restart: unless-stopped
-    command: [ "server", "-s3", "-s3.port=8333" ]
+    command: [ "server", -ip.bind=0.0.0.0, "-s3", "-s3.port=8333" ]
     environment:
       AWS_ACCESS_KEY_ID: dvbtest
       AWS_SECRET_ACCESS_KEY: dvbtest-secret
@@ -98,9 +98,19 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Scripts directory: pg_backup.sh (pre-backup) and pg_restore.sh (restore hook)
       - ./scripts:/scripts:ro
+    # Some sandboxed Docker environments (notably GitHub Codespaces, which uses
+    # Docker-in-Docker) block direct container-to-container traffic, so the
+    # `s3` service name never connects. The published port on the Docker host is
+    # always reachable, so we route S3 through `host.docker.internal`. The
+    # `host-gateway` entry makes that name resolve on plain Linux Docker too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - TZ=UTC
       - DVB_LOG=dvb=info
+      # Override the endpoint from dvb.example.toml (which uses http://s3:8333)
+      # so the job talks to SeaweedFS via the host's published 8333 port.
+      - DVB__JOB__0__STORAGE__ENDPOINT=http://host.docker.internal:8333
       # Passed through to pg_backup.sh
       - PGPASSWORD=postgrespassword
       # Dropbox

@@ -1,12 +1,14 @@
 //! Secret-free summary models for configured jobs.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::Serialize;
 
 use crate::config::{
-    self, Compression, Config, HookConfig, KnownHostsStrategy, RunOn, ScheduleSource, StorageConfig,
+    self, Compression, Config, HookConfig, KnownHostsStrategy, RestoreHookConfig, RunOn,
+    ScheduleSource, StorageConfig,
 };
 use crate::scheduler;
 
@@ -28,8 +30,10 @@ pub struct JobSummary {
     pub stop_containers: Vec<String>,
     /// Backend type and non-secret configuration parameters.
     pub storage: StorageSummary,
-    pub pre: Vec<HookSummary>,
-    pub post: Vec<HookSummary>,
+    pub pre_backup: Option<HookSummary>,
+    pub post_backup: Option<HookSummary>,
+    pub pre_restore: Option<HookSummary>,
+    pub post_restore: Option<HookSummary>,
     /// Next scheduled execution time in the job's timezone.
     pub next_run: Option<DateTime<FixedOffset>>,
     /// Remote storage statistics (populated only when `--remote` is requested).
@@ -162,25 +166,49 @@ pub struct HookSummary {
 }
 
 impl HookSummary {
+    /// The program a hook runs: `cmd[0]` or its script path.
+    fn program_for(cmd: Option<&Vec<String>>, script: Option<&PathBuf>) -> Vec<String> {
+        if let Some(cmd) = cmd
+            && let Some(program) = cmd.first()
+        {
+            vec![(*program).clone()]
+        } else if let Some(script) = script {
+            vec![script.display().to_string()]
+        } else {
+            vec![]
+        }
+    }
+
     /// Build a pre-hook summary. Pre-hooks do not specify `run_on`.
     #[must_use]
     pub fn from_pre_hook(hook: &HookConfig) -> Self {
         Self {
-            cmd: hook.cmd.first().cloned().into_iter().collect(),
+            cmd: Self::program_for(hook.cmd.as_ref(), hook.script.as_ref()),
             container: hook.container.clone(),
             timeout_secs: hook.timeout_secs,
             run_on: None,
         }
     }
 
-    /// Build a post-hook summary.
+    /// Build a post-backup hook summary (carries its `run_on`).
     #[must_use]
     pub fn from_post_hook(hook: &HookConfig) -> Self {
         Self {
-            cmd: hook.cmd.first().cloned().into_iter().collect(),
+            cmd: Self::program_for(hook.cmd.as_ref(), hook.script.as_ref()),
             container: hook.container.clone(),
             timeout_secs: hook.timeout_secs,
             run_on: Some(hook.run_on),
+        }
+    }
+
+    /// Build a hook summary from a post-restore hook (`cmd`/`script`, `container`, `timeout`).
+    #[must_use]
+    pub fn from_restore_hook(hook: &RestoreHookConfig) -> Self {
+        Self {
+            cmd: Self::program_for(hook.cmd.as_ref(), hook.script.as_ref()),
+            container: hook.container.clone(),
+            timeout_secs: hook.timeout_secs,
+            run_on: None,
         }
     }
 }
@@ -219,8 +247,13 @@ pub fn summarize(cfg: &Config, now: DateTime<Utc>) -> Vec<JobSummary> {
                 min_keep: job.min_keep,
                 stop_containers: job.stop_containers.clone(),
                 storage: StorageSummary::from_config(&job.storage),
-                pre: job.pre.iter().map(HookSummary::from_pre_hook).collect(),
-                post: job.post.iter().map(HookSummary::from_post_hook).collect(),
+                pre_backup: job.pre_backup.as_ref().map(HookSummary::from_pre_hook),
+                post_backup: job.post_backup.as_ref().map(HookSummary::from_post_hook),
+                pre_restore: job.pre_restore.as_ref().map(HookSummary::from_pre_hook),
+                post_restore: job
+                    .post_restore
+                    .as_ref()
+                    .map(HookSummary::from_restore_hook),
                 next_run,
                 remote: None,
             }
@@ -297,15 +330,17 @@ mod tests {
                 secret_access_key: Some(SecretString::new(secret)),
                 force_path_style: true,
             }),
-            pre: vec![HookConfig {
-                cmd: vec!["dump.sh".to_owned(), hook_arg.to_owned()],
+            pre_backup: Some(HookConfig {
+                cmd: Some(vec!["dump.sh".to_owned(), hook_arg.to_owned()]),
+                script: None,
                 run_on: RunOn::Success,
                 container: None,
                 timeout_secs: 30,
-            }],
-            post: vec![],
+            }),
+            post_backup: None,
             run_on_start: false,
-            restore: None,
+            pre_restore: None,
+            post_restore: None,
         }
     }
 
@@ -332,10 +367,11 @@ mod tests {
                 key_path: Some(PathBuf::from(format!("/secrets/{key}"))),
                 known_hosts_strategy: KnownHostsStrategy::Strict,
             }),
-            pre: vec![],
-            post: vec![],
+            pre_backup: None,
+            post_backup: None,
             run_on_start: false,
-            restore: None,
+            pre_restore: None,
+            post_restore: None,
         }
     }
 
@@ -363,10 +399,11 @@ mod tests {
                 client_secret: Some(SecretString::new(secret)),
                 refresh_token: Some(SecretString::new(refresh)),
             }),
-            pre: vec![],
-            post: vec![],
+            pre_backup: None,
+            post_backup: None,
             run_on_start: false,
-            restore: None,
+            pre_restore: None,
+            post_restore: None,
         }
     }
 
@@ -450,10 +487,11 @@ mod tests {
                         root: PathBuf::from("/backup"),
                         prefix: String::new(),
                     }),
-                    pre: vec![],
-                    post: vec![],
+                    pre_backup: None,
+                    post_backup: None,
                     run_on_start: false,
-                    restore: None,
+                    pre_restore: None,
+                    post_restore: None,
                 },
                 JobConfig {
                     name: "berlin-job".to_owned(),
@@ -476,10 +514,11 @@ mod tests {
                         root: PathBuf::from("/backup"),
                         prefix: String::new(),
                     }),
-                    pre: vec![],
-                    post: vec![],
+                    pre_backup: None,
+                    post_backup: None,
                     run_on_start: false,
-                    restore: None,
+                    pre_restore: None,
+                    post_restore: None,
                 },
             ],
         };

@@ -1,8 +1,7 @@
 [docker]
 socket = "/var/run/docker.sock"
 
-[[job]]
-name = "db"
+[job.db]
 cron = "0 18 * * 5"
 timezone = "UTC"
 source = ["/backup/pgdata"]
@@ -11,22 +10,29 @@ compression = "zstd"
 retention_days = 14
 min_keep = 3
 stop_containers = ["postgres"]
-  [job.storage]
+  [job.db.storage]
   type = "s3"
   bucket = "bk"
   region = "eu-west-1"
   prefix = "db/"
-  [[job.pre]]
+
+  [job.db.pre_backup]
   cmd = ["pg_dump", "-U", "postgres"]
   container = "postgres"
   timeout_secs = 300
-  [[job.post]]
+
+  [job.db.post_backup]
   cmd = ["/bin/notify.sh", "ok"]
   run_on = "always"
   timeout_secs = 60
 
-[[job]]
-name = "web"
+  [job.db.post_restore]
+  dir = "/restore"
+  cmd = ["pg_restore", "-U", "postgres"]
+  container = "postgres"
+  timeout_secs = 1800
+
+[job.web]
 crontext = "every friday at 18:00"
 timezone = "Europe/Berlin"
 source = ["/var/www/html", "/var/www/uploads"]
@@ -34,13 +40,12 @@ filename = "web-%Y%m%dT%H%M%SZ.tar.zst"
 compression = "zstd"
 retention_days = 7
 min_keep = 2
-  [job.storage]
+  [job.web.storage]
   type = "fs"
   root = "/backup/storage"
   prefix = "web"
 
-[[job]]
-name = "logs"
+[job.logs]
 cron = "0 0 * * *"
 timezone = "UTC"
 source = ["/var/log"]
@@ -48,7 +53,7 @@ filename = "logs-%Y%m%dT%H%M%SZ.tar.zst"
 compression = "gzip"
 retention_days = 30
 min_keep = 5
-  [job.storage]
+  [job.logs.storage]
   type = "sftp"
   endpoint = "sftp.example.com:22"
   user = "backupuser"

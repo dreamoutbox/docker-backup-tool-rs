@@ -2,45 +2,21 @@
 //!
 //! The config file is TOML. Values can be overridden from the environment with
 //! the `DVB__` prefix and `__` as the nesting separator, e.g.
-//! `DVB__JOB__0__NAME=db`. Secrets additionally accept a `*_FILE` sibling key
-//! pointing at a file whose first line (trailing newline stripped) is the
-//! value, which keeps them out of `docker inspect` output and process listings.
+//! `DVB__JOB__DB__CRONTEXT="every 15 minutes"`. Secrets additionally accept a
+//! `*_FILE` sibling key pointing at a file whose first line (trailing newline
+//! stripped) is the value, which keeps them out of `docker inspect` output and
+//! process listings.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone as _, Utc};
+use figment::Figment;
 use figment::providers::{Env, Format, Toml};
-use figment::value::{Dict, Map, Value};
-use figment::{Figment, Metadata, Profile, Provider};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Error, Result};
-
-/// Provider that normalizes `[[job]]` array into indexed dictionary elements so
-/// environment variables such as `DVB__JOB__0__CRONTEXT` merge recursively.
-struct NormalizedToml<P>(P);
-
-impl<P: AsRef<Path>> Provider for NormalizedToml<P> {
-    fn metadata(&self) -> Metadata {
-        Toml::file(self.0.as_ref()).metadata()
-    }
-
-    fn data(&self) -> std::result::Result<Map<Profile, Dict>, figment::Error> {
-        let mut map = Toml::file(self.0.as_ref()).data()?;
-        for dict in map.values_mut() {
-            if let Some(Value::Array(tag, jobs)) = dict.remove("job") {
-                let mut job_map = Dict::new();
-                for (i, job) in jobs.into_iter().enumerate() {
-                    job_map.insert(i.to_string(), job);
-                }
-                dict.insert("job".to_owned(), Value::Dict(tag, job_map));
-            }
-        }
-        Ok(map)
-    }
-}
 
 /// Default location of the configuration file inside the container image.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/dvb/config.toml";
@@ -81,34 +57,21 @@ where
         type Value = Vec<JobConfig>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a sequence of jobs or an indexed map of jobs")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut jobs = Vec::new();
-            while let Some(job) = seq.next_element()? {
-                jobs.push(job);
-            }
-            Ok(jobs)
+            formatter.write_str("a map of jobs keyed by name, `[job.<name>]`")
         }
 
         fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
         where
             M: de::MapAccess<'de>,
         {
-            let mut indexed_jobs: BTreeMap<String, JobConfig> = BTreeMap::new();
-            while let Some((key, value)) = map.next_entry()? {
-                indexed_jobs.insert(key, value);
+            // Each `[job.<name>]` table becomes a map entry; the key is the job
+            // name, and the table body carries no `name` field of its own.
+            let mut jobs: BTreeMap<String, JobConfig> = BTreeMap::new();
+            while let Some((key, mut job)) = map.next_entry::<String, JobConfig>()? {
+                job.name = key;
+                jobs.insert(job.name.clone(), job);
             }
-            let mut pairs: Vec<(usize, JobConfig)> = indexed_jobs
-                .into_iter()
-                .filter_map(|(k, v)| k.parse::<usize>().ok().map(|idx| (idx, v)))
-                .collect();
-            pairs.sort_by_key(|(idx, _)| *idx);
-            Ok(pairs.into_iter().map(|(_, job)| job).collect())
+            Ok(jobs.into_values().collect())
         }
     }
 
@@ -139,7 +102,9 @@ pub enum ScheduleSource {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobConfig {
-    /// Unique job name, used by `--job`, the lock file and `DVB_JOB`.
+    /// Unique job name, derived from the `[job.<name>]` table key, used by
+    /// `--job`, the lock file and `DVB_JOB`.
+    #[serde(skip)]
     pub name: String,
 
     /// Standard five field cron expression, evaluated in the `TZ` of the process.
@@ -195,35 +160,51 @@ pub struct JobConfig {
     pub storage: StorageConfig,
 
     #[serde(default)]
-    pub pre: Vec<HookConfig>,
+    pub pre_backup: Option<HookConfig>,
 
     #[serde(default)]
-    pub post: Vec<HookConfig>,
+    pub post_backup: Option<HookConfig>,
 
     /// Run this job once at daemon start, before its first scheduled run.
     #[serde(default)]
     pub run_on_start: bool,
 
-    /// Optional defaults for `dvb restore <job>`.
+    /// Hook run before a restore starts.
     #[serde(default)]
-    pub restore: Option<RestoreConfig>,
+    pub pre_restore: Option<HookConfig>,
+
+    /// Post-restore hook with the default extraction target and timeout.
+    #[serde(default)]
+    pub post_restore: Option<RestoreHookConfig>,
 }
 
-/// Optional default settings for restoring a job's backup.
+/// Optional default restore hook for a job.
+///
+/// Exactly one of `cmd` or `script` is required to perform a restore where a
+/// hook is configured; `dir` gives the default extraction target and
+/// `container` moves execution into a running container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RestoreConfig {
-    /// Default extraction target directory when no script is specified.
+pub struct RestoreHookConfig {
+    /// Default extraction target directory when no `--to` is passed.
     #[serde(default)]
     pub dir: Option<PathBuf>,
 
-    /// Optional default restore script to execute.
+    /// Executable file run after extraction. Mutually exclusive with `cmd`.
     #[serde(default)]
     pub script: Option<PathBuf>,
 
-    /// Timeout in seconds for the restore script.
+    /// Argument vector run after extraction. Mutually exclusive with `script`.
+    #[serde(default)]
+    pub cmd: Option<Vec<String>>,
+
+    /// Container to run the restore in; `None` runs it locally.
+    #[serde(default)]
+    pub container: Option<String>,
+
+    /// Timeout in seconds for the restore step.
     #[serde(default = "default_script_timeout")]
-    pub script_timeout_secs: u64,
+    pub timeout_secs: u64,
 }
 
 const fn default_script_timeout() -> u64 {
@@ -299,11 +280,20 @@ impl Compression {
 }
 
 /// A pre or post hook.
+///
+/// Exactly one of `cmd` (an argument vector) or `script` (an executable file)
+/// must be configured; validation enforces that. Either can run locally or
+/// inside a container when `container` is set.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
-    /// Argument vector, executed without a shell.
-    pub cmd: Vec<String>,
+    /// Argument vector, executed without a shell. Mutually exclusive with `script`.
+    #[serde(default)]
+    pub cmd: Option<Vec<String>>,
+
+    /// Path to an executable file, run directly. Mutually exclusive with `cmd`.
+    #[serde(default)]
+    pub script: Option<PathBuf>,
 
     /// When this hook should run (only meaningful for post hooks).
     #[serde(default)]
@@ -316,6 +306,20 @@ pub struct HookConfig {
     /// Seconds before the hook is killed.
     #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u64,
+}
+
+impl HookConfig {
+    /// Human-readable form of what the hook runs, for logs and CI checks.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if let Some(cmd) = &self.cmd {
+            cmd.join(" ")
+        } else if let Some(script) = &self.script {
+            script.display().to_string()
+        } else {
+            "<no command>".to_owned()
+        }
+    }
 }
 
 const fn default_hook_timeout() -> u64 {
@@ -602,7 +606,7 @@ impl Config {
     /// [`ConfigError::Invalid`] if it parses but a job does not make sense.
     pub fn load(path: &Path, mode: ValidationMode) -> Result<Self> {
         let figment = Figment::new()
-            .merge(NormalizedToml(path))
+            .merge(Toml::file(path))
             .merge(Env::prefixed(ENV_PREFIX).split("__").lowercase(true));
 
         let mut config: Self = figment.extract().map_err(|source| ConfigError::Parse {
@@ -691,7 +695,7 @@ impl Config {
     /// [`ConfigError::Invalid`] naming the first missing path or unreadable file.
     pub fn validate_runtime(&self) -> Result<()> {
         if self.jobs.is_empty() {
-            return Err(invalid("no [[job]] defined"));
+            return Err(invalid("no [job.<name>] defined"));
         }
         for job in &self.jobs {
             job.validate_runtime(&self.docker)?;
@@ -801,28 +805,99 @@ impl JobConfig {
         Ok(())
     }
 
-    fn validate_hooks(&self) -> Result<()> {
-        for (phase, hooks) in [("pre", &self.pre), ("post", &self.post)] {
-            for (index, hook) in hooks.iter().enumerate() {
-                if hook.cmd.is_empty() {
-                    return Err(invalid(format!(
-                        "job `{}`: {phase} hook #{index} has an empty cmd",
-                        self.name
-                    )));
-                }
-                if hook.cmd.iter().any(String::is_empty) {
-                    return Err(invalid(format!(
-                        "job `{}`: {phase} hook #{index} has an empty argument",
-                        self.name
-                    )));
-                }
-                if hook.timeout_secs == 0 {
-                    return Err(invalid(format!(
-                        "job `{}`: {phase} hook #{index} timeout_secs must be >= 1",
-                        self.name
-                    )));
-                }
+    fn validate_one_hook(&self, label: &str, hook: &HookConfig) -> Result<()> {
+        if hook.cmd.is_some() == hook.script.is_some() {
+            return Err(invalid(format!(
+                "job `{}`: {label} must configure exactly one of `cmd` or `script`",
+                self.name
+            )));
+        }
+        if let Some(cmd) = &hook.cmd {
+            if cmd.is_empty() {
+                return Err(invalid(format!(
+                    "job `{}`: {label} has an empty cmd",
+                    self.name
+                )));
             }
+            if cmd.iter().any(String::is_empty) {
+                return Err(invalid(format!(
+                    "job `{}`: {label} has an empty argument",
+                    self.name
+                )));
+            }
+        }
+        if hook.timeout_secs == 0 {
+            return Err(invalid(format!(
+                "job `{}`: {label} timeout_secs must be >= 1",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_hooks(&self) -> Result<()> {
+        if let Some(hook) = &self.pre_backup {
+            self.validate_one_hook("pre_backup", hook)?;
+        }
+        if let Some(hook) = &self.post_backup {
+            self.validate_one_hook("post_backup", hook)?;
+        }
+        if let Some(hook) = &self.pre_restore {
+            self.validate_one_hook("pre_restore", hook)?;
+        }
+        if let Some(restore) = &self.post_restore {
+            self.validate_restore_hook(restore)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this job needs the Docker socket at all.
+    ///
+    /// Stops, starts and container hooks all go through the daemon; a job with
+    /// none of those runs without one, which is what keeps `[docker]` optional.
+    #[must_use]
+    pub fn needs_docker(&self) -> bool {
+        self.wants_stop()
+            || [
+                self.pre_backup.as_ref(),
+                self.post_backup.as_ref(),
+                self.pre_restore.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|hook| hook.container.is_some())
+            || self
+                .post_restore
+                .as_ref()
+                .is_some_and(|r| r.container.is_some())
+    }
+
+    fn validate_restore_hook(&self, restore: &RestoreHookConfig) -> Result<()> {
+        if restore.script.is_some() == restore.cmd.is_some() {
+            return Err(invalid(format!(
+                "job `{}`: post_restore must configure exactly one of `cmd` or `script`",
+                self.name
+            )));
+        }
+        if let Some(cmd) = &restore.cmd {
+            if cmd.is_empty() {
+                return Err(invalid(format!(
+                    "job `{}`: post_restore has an empty cmd",
+                    self.name
+                )));
+            }
+            if cmd.iter().any(String::is_empty) {
+                return Err(invalid(format!(
+                    "job `{}`: post_restore has an empty argument",
+                    self.name
+                )));
+            }
+        }
+        if restore.timeout_secs == 0 {
+            return Err(invalid(format!(
+                "job `{}`: post_restore timeout_secs must be >= 1",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -949,20 +1024,6 @@ impl JobConfig {
     #[must_use]
     pub fn wants_stop(&self) -> bool {
         !self.stop_containers.is_empty() || self.stop_label.is_some()
-    }
-
-    /// Whether this job needs the Docker socket at all.
-    ///
-    /// Stops, starts and container hooks all go through the daemon; a job with
-    /// none of those runs without one, which is what keeps `[docker]` optional.
-    #[must_use]
-    pub fn needs_docker(&self) -> bool {
-        self.wants_stop()
-            || self
-                .pre
-                .iter()
-                .chain(self.post.iter())
-                .any(|hook| hook.container.is_some())
     }
 
     /// Render the remote object name for `now`, in UTC.
@@ -1119,19 +1180,38 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// A valid single-job config body under the new `[job.<name>]` schema.
     fn job_yaml() -> String {
         r#"
+[job.db]
 cron = "0 3 * * *"
 source = ["/backup/pgdata"]
 filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
 retention_days = 14
 min_keep = 3
-
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/backups"
 "#
         .to_owned()
+    }
+
+    /// The same body with the job name changed, quoting the key so any name is
+    /// a legal TOML key (used by the job name rules test).
+    fn named_job(name: &str) -> String {
+        format!(
+            r#"
+[job."{name}"]
+cron = "0 3 * * *"
+source = ["/backup/pgdata"]
+filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
+retention_days = 14
+min_keep = 3
+  [job."{name}".storage]
+  type = "fs"
+  root = "/tmp/backups"
+"#
+        )
     }
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
@@ -1144,7 +1224,7 @@ min_keep = 3
     fn parse(body: &str, dir: &Path) -> Result<Config> {
         let path = write_config(dir, body);
         let figment = Figment::new()
-            .merge(NormalizedToml(&path))
+            .merge(Toml::file(&path))
             .merge(Env::prefixed(ENV_PREFIX).split("__").lowercase(true));
         let mut config: Config = figment.extract().map_err(|source| ConfigError::Parse {
             path: path.clone(),
@@ -1157,11 +1237,12 @@ min_keep = 3
     #[test]
     fn parses_a_minimal_job() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let body = format!("[[job]]\nname = \"db\"\n{}\n", job_yaml());
+        let body = job_yaml();
         let config = parse(&body, dir.path()).expect("valid config");
 
         assert_eq!(config.job_count(), 1);
         let job = config.job("db").expect("job exists");
+        assert_eq!(job.name, "db");
         assert_eq!(job.compression, Compression::Zstd);
         assert_eq!(job.retention_days, 14);
         assert_eq!(job.min_keep, 3);
@@ -1171,29 +1252,16 @@ min_keep = 3
     }
 
     #[test]
-    fn rejects_duplicate_job_names() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let body = format!(
-            "[[job]]\nname = \"db\"\n{}\n[[job]]\nname = \"db\"\n{}\n",
-            job_yaml(),
-            job_yaml()
-        );
-        let err = parse(&body, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("duplicate job name `db`"), "{err}");
-    }
-
-    #[test]
     fn rejects_duplicate_source_basenames() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/a/data", "/b/data"]
 filename = "data-%Y%m%dT%H%M%SZ"
 retention_days = 1
 min_keep = 1
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1208,14 +1276,13 @@ min_keep = 1
     fn rejects_a_filename_without_a_year() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%m%d.tar"
 retention_days = 1
 min_keep = 1
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1227,14 +1294,13 @@ min_keep = 1
     fn rejects_a_filename_without_seconds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M.tar"
 retention_days = 1
 min_keep = 1
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1246,14 +1312,13 @@ min_keep = 1
     fn rejects_zero_retention_and_min_keep() {
         let dir = tempfile::tempdir().expect("tempdir");
         let zero_retention = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
 retention_days = 0
 min_keep = 1
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1274,12 +1339,11 @@ min_keep = 1
     fn rejects_an_empty_source_list() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = []
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1294,12 +1358,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn rejects_an_invalid_cron() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "not a cron"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1311,12 +1374,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn accepts_a_valid_cron() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1330,8 +1392,8 @@ filename = "db-%Y%m%dT%H%M%SZ"
     #[test]
     fn rejects_an_unknown_top_level_key() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Placed before `[[job]]`, otherwise TOML would nest it in the table.
-        let body = format!("nonsense = true\n[[job]]\nname = \"db\"\n{}\n", job_yaml());
+        // Placed before `[job.db]`, otherwise TOML would nest it in the table.
+        let body = format!("nonsense = true\n{}", job_yaml());
         let err = parse(&body, dir.path()).unwrap_err();
         assert!(err.to_string().contains("nonsense"), "{err}");
     }
@@ -1340,12 +1402,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn rejects_an_unknown_storage_type() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "carrier-pigeon"
 "#;
         let err = parse(body, dir.path()).unwrap_err();
@@ -1355,7 +1416,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
     #[test]
     fn unknown_job_error_lists_configured_jobs() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let body = format!("[[job]]\nname = \"db\"\n{}\n", job_yaml());
+        let body = job_yaml();
         let config = parse(&body, dir.path()).expect("valid config");
         let err = config.job("nope").unwrap_err();
         assert!(err.to_string().contains("configured jobs: db"), "{err}");
@@ -1364,12 +1425,12 @@ filename = "db-%Y%m%dT%H%M%SZ"
     #[test]
     fn docker_socket_is_optional() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let body = format!("[[job]]\nname = \"db\"\n{}\n", job_yaml());
+        let body = job_yaml();
         let config = parse(&body, dir.path()).expect("valid config");
         assert!(config.docker.socket.is_none());
 
         let with_socket = format!(
-            "[docker]\nsocket = \"/var/run/docker.sock\"\n[[job]]\nname = \"db\"\n{}\n",
+            "[docker]\nsocket = \"/var/run/docker.sock\"\n{}",
             job_yaml()
         );
         let config = parse(&with_socket, dir.path()).expect("valid config");
@@ -1383,12 +1444,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn secrets_are_redacted_in_debug_output() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "dropbox"
   root = "/backups"
   client_id = "super-secret-id"
@@ -1432,10 +1492,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
                 root: PathBuf::from("/tmp"),
                 prefix: String::new(),
             }),
-            pre: vec![],
-            post: vec![],
+            pre_backup: None,
+            post_backup: None,
             run_on_start: false,
-            restore: None,
+            pre_restore: None,
+            post_restore: None,
         };
         let now = Utc.with_ymd_and_hms(2024, 3, 5, 6, 7, 8).unwrap();
         assert_eq!(job.object_name(now), "pgdata-20240305T060708Z.tar.zst");
@@ -1473,13 +1534,12 @@ filename = "db-%Y%m%dT%H%M%SZ"
 [docker]
 socket = "/var/run/docker.sock"
 
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
 stop_containers = ["postgres"]
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1491,13 +1551,12 @@ stop_containers = ["postgres"]
     fn a_job_that_needs_docker_requires_a_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
 stop_containers = ["postgres"]
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1521,52 +1580,73 @@ stop_containers = ["postgres"]
 [docker]
 socket = "/var/run/docker.sock"
 
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 
-  [[job.pre]]
+  [job.db.pre_backup]
   cmd = ["pg_dump", "-f", "/backup/pgdata/dump.sql"]
   container = "postgres"
   timeout_secs = 300
 
-  [[job.post]]
+  [job.db.post_backup]
   cmd = ["/bin/notify.sh"]
   run_on = "always"
 "#;
         let config = parse(body, dir.path()).expect("valid config");
         let job = config.job("db").expect("job");
-        assert_eq!(job.pre.len(), 1);
-        assert_eq!(job.pre[0].container.as_deref(), Some("postgres"));
-        assert_eq!(job.pre[0].timeout_secs, 300);
-        assert_eq!(job.post.len(), 1);
-        assert_eq!(job.post[0].run_on, RunOn::Always);
-        assert_eq!(job.post[0].timeout_secs, 300);
+        let pre = job.pre_backup.as_ref().expect("pre_backup");
+        assert_eq!(pre.container.as_deref(), Some("postgres"));
+        assert_eq!(pre.timeout_secs, 300);
+        let post = job.post_backup.as_ref().expect("post_backup");
+        assert_eq!(post.run_on, RunOn::Always);
+        assert_eq!(post.timeout_secs, 300);
     }
 
     #[test]
     fn rejects_an_empty_hook_command() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 
-  [[job.post]]
+  [job.db.post_backup]
   cmd = []
 "#;
         let err = parse(body, dir.path()).unwrap_err();
         assert!(err.to_string().contains("empty cmd"), "{err}");
+    }
+
+    #[test]
+    fn rejects_both_cmd_and_script_in_a_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = r#"
+[job.db]
+cron = "0 3 * * *"
+source = ["/data"]
+filename = "db-%Y%m%dT%H%M%SZ"
+  [job.db.storage]
+  type = "fs"
+  root = "/tmp/x"
+
+  [job.db.pre_backup]
+  cmd = ["echo", "hi"]
+  script = "/scripts/echo.sh"
+"#;
+        let err = parse(body, dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one of `cmd` or `script`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1577,47 +1657,48 @@ filename = "db-%Y%m%dT%H%M%SZ"
     }
 
     #[test]
-    fn parses_restore_configuration() {
+    fn parses_post_restore_configuration() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 
-  [job.restore]
+  [job.db.post_restore]
   dir = "/restore"
   script = "/scripts/pg_restore.sh"
-  script_timeout_secs = 1800
+  timeout_secs = 1800
 "#;
         let config = parse(body, dir.path()).unwrap();
-        let restore = config.jobs[0].restore.as_ref().expect("restore configured");
+        let restore = config.jobs[0]
+            .post_restore
+            .as_ref()
+            .expect("post_restore configured");
         assert_eq!(restore.dir.as_deref(), Some(Path::new("/restore")));
         assert_eq!(
             restore.script.as_deref(),
             Some(Path::new("/scripts/pg_restore.sh"))
         );
-        assert_eq!(restore.script_timeout_secs, 1800);
+        assert_eq!(restore.timeout_secs, 1800);
     }
 
     #[test]
-    fn rejects_unknown_fields_in_restore() {
+    fn rejects_unknown_fields_in_post_restore() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 
-  [job.restore]
+  [job.db.post_restore]
   dir = "/restore"
   unknown = true
 "#;
@@ -1630,13 +1711,12 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn rejects_both_cron_and_crontext() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 crontext = "every day at 03:00"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1652,11 +1732,10 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn rejects_neither_cron_nor_crontext() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1672,12 +1751,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn accepts_crontext_and_resolves_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 crontext = "every friday at 18:00"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1694,12 +1772,11 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn rejects_invalid_crontext() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 crontext = "every 5 hours"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1711,13 +1788,12 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn rejects_invalid_timezone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 timezone = "Mars/Olympus_Mons"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1733,13 +1809,12 @@ filename = "db-%Y%m%dT%H%M%SZ"
     fn accepts_valid_job_timezone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 timezone = "America/New_York"
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#;
@@ -1757,19 +1832,18 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let path = write_config(
             dir.path(),
             r#"
-[[job]]
-name = "db"
+[job.db]
 source = ["/data"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/tmp/x"
 "#,
         );
 
         let figment = Figment::new()
-            .merge(NormalizedToml(&path))
-            .merge(("job.0.crontext", "every 15 minutes"));
+            .merge(Toml::file(&path))
+            .merge(("job.db.crontext", "every 15 minutes"));
         let mut config: Config = figment.extract().expect("extract");
         config.validate().expect("validate");
         let job = config.job("db").expect("job");
@@ -1786,15 +1860,14 @@ filename = "db-%Y%m%dT%H%M%SZ"
         let non_existent = dir.path().join("definitely-does-not-exist-dir");
         let body = format!(
             r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = ["{}"]
 filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
 retention_days = 14
 min_keep = 3
 
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "{}"
 "#,
@@ -1841,9 +1914,9 @@ min_keep = 3
         assert!(!is_valid_job_name("job\"name"));
         assert!(!is_valid_job_name("job'name"));
 
-        // Config parsing checks
+        // Config parsing checks: the `[job.<name>]` key sets the job name.
         let dir = tempfile::tempdir().expect("tempdir");
-        let valid_body = format!("[[job]]\nname = \"pg-main_1\"\n{}\n", job_yaml());
+        let valid_body = named_job("pg-main_1");
         assert!(parse(&valid_body, dir.path()).is_ok());
 
         for bad in [
@@ -1855,12 +1928,11 @@ min_keep = 3
             "job/name",
             "job name",
         ] {
-            let bad_body = format!("[[job]]\nname = \"{bad}\"\n{}\n", job_yaml());
+            let bad_body = named_job(bad);
             let err =
                 parse(&bad_body, dir.path()).expect_err(&format!("accepted bad name `{bad}`"));
             assert!(
-                err.to_string().contains("job name")
-                    || err.to_string().contains("invalid job name"),
+                err.to_string().contains("job name"),
                 "unexpected error message: {err}"
             );
         }

@@ -33,8 +33,7 @@ impl Fixture {
         let config = tmp.path().join("config.toml");
         let template = format!(
             r#"
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"
 source = [{}]
 filename = "{filename}"
@@ -42,7 +41,7 @@ compression = "{compression}"
 retention_days = 14
 min_keep = 3
 
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = {}
   prefix = "backups"

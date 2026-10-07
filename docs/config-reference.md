@@ -15,18 +15,18 @@ dvb init -o dvb.toml
 
 - [Global Settings](#global-settings)
 - [Docker Configuration](#docker-configuration)
-- [Job Settings (`[[job]]`)](#job-settings-job)
+- [Job Settings (`[job.<name>]`)](#job-settings-jobname)
   - [Schedule (`cron` vs `crontext`)](#schedule-cron-vs-crontext)
   - [Timezone & Startup](#timezone--startup)
   - [File Archiving & Retention](#file-archiving--retention)
   - [Container Stopping](#container-stopping)
-  - [Storage Backends (`[job.storage]`)](#storage-backends-jobstorage)
+  - [Storage Backends (`[job.<name>.storage]`)](#storage-backends-jobnamestorage)
     - [Filesystem (`type = "fs"`)](#filesystem-type--fs)
     - [S3 Compatible (`type = "s3"`)](#s3-compatible-type--s3)
     - [SFTP (`type = "sftp"`)](#sftp-type--sftp)
     - [Dropbox (`type = "dropbox"`)](#dropbox-type--dropbox)
-  - [Restore Defaults (`[job.restore]`)](#restore-defaults-jobrestore)
-  - [Hooks (`[[job.pre]]`, `[[job.post]]`)](#hooks-jobpre-jobpost)
+  - [Hooks (`pre_backup`, `post_backup`, `pre_restore`, `post_restore`)](#hooks-hook-tables)
+  - [Restore Defaults (`[job.<name>.post_restore]`)](#restore-defaults-jobnamepost_restore)
 - [Environment Overrides & Secrets](#environment-overrides--secrets)
 
 ---
@@ -59,9 +59,23 @@ socket = "/var/run/docker.sock"
 
 ---
 
-## Job Settings (`[[job]]`)
+## Job Settings (`[job.<name>]`)
 
-Backup configurations contain one or more `[[job]]` array tables.
+Backup configurations contain one or more `[job.<name>]` tables. The table key
+`<name>` is the job name; there is no `name` field inside the table. The name
+must match `^[a-z0-9][a-z0-9_-]{0,62}$` (alphanumeric, underscores, hyphens; max
+63 characters).
+
+```toml
+[job.db]
+cron = "0 3 * * *"
+source = ["/backup/pgdata"]
+filename = "pgdata-%Y%m%dT%H%M%SZ.tar.zst"
+
+  [job.db.storage]
+  type = "fs"
+  root = "/backups"
+```
 
 ### Schedule (`cron` vs `crontext`)
 
@@ -83,7 +97,6 @@ Each job must define **exactly one** of `cron` or `crontext`. Specifying both or
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | *Required* | Unique name for the job. Must match `^[a-z0-9][a-z0-9_-]{0,62}$` (alphanumeric, underscores, hyphens; max 63 characters). |
 | `source` | array of strings | *Required* | List of paths to include in the backup archive. Non-existent paths trigger a validation error during runtime operations. |
 | `filename` | string | *Required* | Archive filename pattern containing `strftime` timestamp specifiers. Must include year (`%Y`) and seconds (`%S`), e.g. `"backup-%Y%m%dT%H%M%SZ.tar.zst"`. |
 | `compression` | string | `"zstd"` | Archive compression format. Supported values: `"zstd"`, `"gzip"`, `"none"`. |
@@ -103,16 +116,16 @@ Ensure database and filesystem consistency by pausing target containers while ar
 
 ---
 
-## Storage Backends (`[job.storage]`)
+## Storage Backends (`[job.<name>.storage]`)
 
-Each job must define one storage table `[job.storage]` specifying `type`.
+Each job must define one storage table `[job.<name>.storage]` specifying `type`.
 
 ### Filesystem (`type = "fs"`)
 
 Stores backups in a local filesystem or mounted network share.
 
 ```toml
-[job.storage]
+[job.db.storage]
 type = "fs"
 root = "/backups"
 prefix = "db"
@@ -129,7 +142,7 @@ prefix = "db"
 Uploads backups to AWS S3, Cloudflare R2, MinIO, Wasabi, SeaweedFS, or other S3-compatible object stores.
 
 ```toml
-[job.storage]
+[job.db.storage]
 type = "s3"
 bucket = "my-backup-bucket"
 region = "us-east-1"
@@ -156,7 +169,7 @@ force_path_style = true
 Uploads backups to a remote server using SFTP over SSH.
 
 ```toml
-[job.storage]
+[job.db.storage]
 type = "sftp"
 endpoint = "sftp.example.com:22"
 user = "backupuser"
@@ -179,7 +192,7 @@ known_hosts_strategy = "strict"
 Uploads backups to Dropbox using OAuth 2.0 refresh tokens.
 
 ```toml
-[job.storage]
+[job.db.storage]
 type = "dropbox"
 root = "/backups"
 client_id = "/run/secrets/dropbox_client_id"
@@ -201,51 +214,50 @@ Either `token` (direct access token) or the complete OAuth refresh triplet (`cli
 
 ---
 
-## Restore Defaults (`[job.restore]`)
+## Hooks (hook tables)
 
-Configures default values for the `dvb restore <job>` command.
-
-```toml
-[job.restore]
-dir = "/restore"
-script = "/scripts/pg_restore.sh"
-script_timeout_secs = 3600
-cleanup = true
-```
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `dir` | string | *None* | Default directory to extract restored files into. Can be overridden with `--to <dir>`. |
-| `script` | string | *None* | Path to post-extraction hook script. Can be overridden with `--script <path>`. |
-| `script_timeout_secs` | integer | `300` | Maximum execution time in seconds for the restore script before SIGKILL. |
-| `cleanup` | boolean | `false` | If `true`, removes the extracted staging directory after the restore script finishes successfully. |
-
-See [`docs/restore.md`](restore.md) for full details on the restore flow and environment variables.
-
----
-
-## Hooks (`[[job.pre]]`, `[[job.post]]`)
-
-Hooks run commands before and after archive creation.
+Hooks run commands before and after backup and restore steps. A job may define
+up to four single hook tables. Exactly one of `cmd` (an argument vector) or
+`script` (an executable file path) must be present in a configured hook.
 
 ```toml
-[[job.pre]]
+[job.db.pre_backup]
 cmd = ["pg_dump", "-U", "postgres", "-f", "/backup/pgdata/dump.sql"]
 container = "postgres"
 timeout_secs = 300
 
-[[job.post]]
+[job.db.post_backup]
 cmd = ["/bin/notify.sh", "Database backup complete"]
 run_on = "always"
 timeout_secs = 60
+
+[job.db.pre_restore]
+cmd = ["/bin/check-free-space.sh"]
+
+[job.db.post_restore]
+dir = "/restore"
+script = "/scripts/pg_restore.sh"
+timeout_secs = 3600
 ```
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `cmd` | array of strings | *Required* | Command and arguments vector executed directly (without a shell). |
-| `container` | string | *None* | Container name or ID to execute the command inside via Docker exec. If omitted, runs in the local `dvb` process/container. Requires `[docker].socket`. |
+| `cmd` | array of strings | *Required\** | Command and arguments vector executed directly (without a shell). |
+| `script` | string | *Required\** | Path to an executable file run directly, without a shell. |
+| `container` | string | *None* | Container name or ID to execute the hook inside via `docker exec`. If omitted, runs in the local `dvb` process/container. Requires `[docker].socket`. |
 | `timeout_secs` | integer | `300` | Process execution timeout in seconds before termination. |
-| `run_on` | string | `"success"` | (*Post-hooks only*) When to run the hook: `"success"` (default), `"failure"`, or `"always"`. |
+| `run_on` | string | `"success"` | (*`post_backup` only*) When to run the hook: `"success"` (default), `"failure"`, or `"always"`. |
+
+\* Exactly one of `cmd` or `script` must be configured.
+
+Hook tables and their phase:
+
+| Table | When it runs |
+|---|---|
+| `[job.<name>.pre_backup]` | Before archiving/uploading a backup. A failure aborts the run. |
+| `[job.<name>.post_backup]` | After the backup, filtered by `run_on`. |
+| `[job.<name>.pre_restore]` | Before a restore begins. |
+| `[job.<name>.post_restore]` | After the archive is extracted during a restore. |
 
 Hooks receive execution context via environment variables:
 - `DVB_JOB`: Job name
@@ -255,9 +267,35 @@ Hooks receive execution context via environment variables:
 
 ---
 
+## Restore Defaults (`[job.<name>.post_restore]`)
+
+The `post_restore` hook also carries the default values for the `dvb restore <job>` command.
+
+```toml
+[job.db.post_restore]
+dir = "/restore"
+script = "/scripts/pg_restore.sh"
+container = "postgres"
+timeout_secs = 3600
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `dir` | string | *None* | Default directory to extract restored files into. Can be overridden with `--to <dir>`. |
+| `cmd` | string | *Required\** | Argument vector for the restore step, run without a shell. |
+| `script` | string | *Required\** | Path to post-extraction hook script. Can be overridden with `--script <path>`. |
+| `container` | string | *None* | Container to run the restore in via `docker exec`. Omit to run locally. Requires `[docker].socket`. |
+| `timeout_secs` | integer | `3600` | Maximum execution time in seconds for the restore step before SIGKILL. |
+
+\* Exactly one of `cmd` or `script` is required.
+
+See [`docs/restore.md`](restore.md) for full details on the restore flow and environment variables.
+
+---
+
 ## Environment Overrides & Secrets
 
-Settings can be overridden via environment variables using double underscores (`__`) as table separators:
+Settings can be overridden via environment variables using double underscores (`__`) as table separators.
 
 | Environment Variable | Equivalent TOML Setting |
 |---|---|
@@ -266,6 +304,6 @@ Settings can be overridden via environment variables using double underscores (`
 | `DVB_LOG_FORMAT` | Log format: `text` or `json` |
 | `DVB_LOCK_DIR` | Lock directory (default `/run/dvb`) |
 | `DVB__SHUTDOWN_GRACE_SECS` | `shutdown_grace_secs` |
-| `DVB__JOB__0__STORAGE__SECRET_ACCESS_KEY` | `[[job]][0].storage.secret_access_key` |
+| `DVB__JOB__DB__STORAGE__SECRET_ACCESS_KEY` | `[job.db].storage.secret_access_key` |
 
 All sensitive keys (passwords, secret access keys, tokens) are wrapped in redacting structures in `dvb`, preventing credentials from leaking in logs or CLI outputs.

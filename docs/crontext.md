@@ -9,8 +9,7 @@ At configuration load time, `crontext` expressions are parsed and resolved into 
 Each job must define **exactly one** of `cron` or `crontext`. Setting both or neither is a configuration validation error.
 
 ```toml
-[[job]]
-name = "postgres"
+[job.postgres]
 crontext = "every friday at 18:00"
 timezone = "America/New_York"       # optional per-job timezone override
 # ...

@@ -52,7 +52,7 @@ docker run --rm -v "$PWD":/work -w /work --user "$(id -u):$(id -g)" dreamoutbox/
 ```
 
 - **Safety & Permissions:** `init` creates files with mode `0600` (read/write by owner only) and never overwrites an existing file unless `--force` is specified.
-- **Secrets:** Generated configurations use file-based secret conventions (e.g. `/run/secrets/...`) or environment variables (`DVB__JOB__0__STORAGE__...`). Fill these in before running `dvb check`.
+- **Secrets:** Generated configurations use file-based secret conventions (e.g. `/run/secrets/...`) or environment variables (`DVB__JOB__BACKUP__STORAGE__...`). Fill these in before running `dvb check`.
 
 ### 2. Inspect configured jobs
 
@@ -180,8 +180,7 @@ shutdown_grace_secs = 60                       # wait up to 60s for running jobs
 [docker]
 socket = "/var/run/docker.sock"                # optional; enables container stop/start/exec
 
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"                             # 5-field cron, evaluated in TZ (default UTC)
 run_on_start = true                            # take an initial backup when daemon starts
 source = ["/backup/pgdata"]                    # paths inside this container
@@ -192,15 +191,16 @@ min_keep = 3
 stop_containers = ["postgres"]                 # stop while archiving for consistency
 stop_timeout_secs = 30
 
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/backups"
   prefix = "db"
 ```
 
-Tables nested under a `[[job]]` must be written `[job.storage]`, not
-`[storage]`: a bare `[storage]` header after `[[job]]` starts a *new top-level*
-table and the job silently loses its backend.
+Jobs are declared with `[job.<name>]` tables; the table key is the job name.
+Tables nested under a job must be written `[job.<name>.storage]`, not
+`[storage]` or `[job.storage]`: a bare `[storage]` header starts a *new
+top-level* table and the job silently loses its backend.
 
 `filename` must contain a second-resolution timestamp (`%Y` and `%S`) because
 retention parses the timestamp back out of the object name.
@@ -254,13 +254,13 @@ See [`docs/crontext.md`](docs/crontext.md) for full syntax and constraints.
 
 ```toml
 # Local filesystem
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "/backups"
   prefix = "db"
 
 # S3 and S3-compatible (AWS, R2, Wasabi, SeaweedFS, ...)
-  [job.storage]
+  [job.db.storage]
   type = "s3"
   bucket = "my-bucket"
   region = "eu-central-1"
@@ -271,7 +271,7 @@ See [`docs/crontext.md`](docs/crontext.md) for full syntax and constraints.
   force_path_style = true            # the default
 
 # SFTP. Shells out to the `ssh` binary, hence openssh-client in the image.
-  [job.storage]
+  [job.db.storage]
   type = "sftp"
   endpoint = "backup.example.com:2222"
   user = "backup"
@@ -292,7 +292,7 @@ verification.
 | `DVB_LOG` | `EnvFilter` directives, e.g. `dvb=debug,s3=trace` |
 | `DVB_LOG_FORMAT` | `text` or `json` |
 | `DVB_LOCK_DIR` | Lock file directory (default `/run/dvb`) |
-| `DVB__JOB__0__NAME` | Config override, `__` separates levels |
+| `DVB__JOB__DB__CRONTEXT` | Config override, `__` separates levels |
 
 Secrets in the config are wrapped in a redacting type: `Debug` and `Display`
 print `***redacted***`, so they cannot leak into logs or `dvb check` output.
@@ -313,7 +313,7 @@ surfaces at load time rather than half way through a backup.
 ### Stopping containers
 
 ```toml
-[[job]]
+[job.db]
 stop_containers = ["postgres", "api"]  # by name or id prefix
 stop_label = "dvb.stop"                # or by label: `key`, or `key=value`
 stop_timeout_secs = 30                 # SIGTERM grace period before SIGKILL
@@ -333,12 +333,12 @@ containers left stopped are worse than a missed rotation.
 ### Hooks
 
 ```toml
-  [[job.pre]]
+  [job.db.pre_backup]
   cmd = ["pg_dump", "-f", "/backup/pgdata/dump.sql"]
   container = "postgres"      # omit to run on this machine
   timeout_secs = 300          # SIGKILL once this elapses
 
-  [[job.post]]
+  [job.db.post_backup]
   cmd = ["/bin/notify.sh"]
   run_on = "always"           # success (default) | failure | always
 ```
@@ -387,7 +387,7 @@ Ensure consistency by either:
    files are archived; OR
 2. Taking a logical dump via a container pre-hook:
    ```toml
-   [[job.pre]]
+   [job.db.pre_backup]
    cmd = ["pg_dump", "-U", "postgres", "-f", "/backup/pgdata/dump.sql"]
    container = "db"
    ```
@@ -427,8 +427,8 @@ Options:
 | Flag | Purpose |
 |---|---|
 | `--from <object>` | Name or path of remote archive to restore (default: newest backup) |
-| `--to <dir>` | Directory to extract files into (overrides `job.restore.dir`) |
-| `--script <path>` | Path to post-extraction hook script (overrides `job.restore.script`) |
+| `--to <dir>` | Directory to extract files into (overrides `job.<name>.post_restore.dir`) |
+| `--script <path>` | Path to post-extraction hook script (overrides `job.<name>.post_restore.script`) |
 | `--script-timeout-secs <secs>` | Timeout in seconds for script execution (default: 300) |
 | `--cleanup` | Delete extracted staging directory after script succeeds |
 | `--force` | Overwrite existing files if target directory is not empty |
@@ -439,15 +439,13 @@ Options:
 Example configuration in `config.toml`:
 
 ```toml
-[[job]]
-name = "db"
+[job.db]
 # ...
 
-  [job.restore]
+  [job.db.post_restore]
   dir = "/backup/restore"
   script = "/scripts/pg_restore.sh"
-  script_timeout_secs = 600
-  cleanup = true
+  timeout_secs = 600
 ```
 
 ### Safety and stdout contract
