@@ -388,34 +388,39 @@ mod tests {
         assert_eq!(j0["storage"]["bucket"], "bk");
         assert_eq!(j0["storage"]["region"], "eu-west-1");
         assert_eq!(j0["storage"]["prefix"], "db/");
-        assert_eq!(j0["pre"][0]["cmd"], serde_json::json!(["pg_dump"]));
-        assert_eq!(j0["pre"][0]["container"], "postgres");
-        assert_eq!(j0["post"][0]["cmd"], serde_json::json!(["/bin/notify.sh"]));
-        assert_eq!(j0["post"][0]["run_on"], "always");
-
-        // Job 1 (crontext used): both crontext and resolved cron set, remote is null
-        let j1 = &jobs[1];
-        assert_eq!(j1["name"], "web");
-        assert_eq!(j1["cron"], "0 18 * * 5");
-        assert_eq!(j1["crontext"], "every friday at 18:00");
-        assert!(j1["remote"].is_null());
-        assert_eq!(j1["storage"]["type"], "fs");
-        assert_eq!(j1["storage"]["root"], "/backup/storage");
-        assert_eq!(j1["storage"]["prefix"], "web");
+        assert_eq!(j0["pre_backup"]["cmd"], serde_json::json!(["pg_dump"]));
+        assert_eq!(j0["pre_backup"]["container"], "postgres");
         assert_eq!(
-            j1["source"],
+            j0["post_backup"]["cmd"],
+            serde_json::json!(["/bin/notify.sh"])
+        );
+        assert_eq!(j0["post_backup"]["run_on"], "always");
+        assert_eq!(j0["post_restore"]["cmd"], serde_json::json!(["pg_restore"]));
+        assert!(j0["pre_restore"].is_null());
+
+        // Job 1 (sftp): crontext is null, sftp keys matched
+        let j1 = &jobs[1];
+        assert_eq!(j1["name"], "logs");
+        assert_eq!(j1["cron"], "0 0 * * *");
+        assert!(j1["crontext"].is_null());
+        assert_eq!(j1["storage"]["type"], "sftp");
+        assert_eq!(j1["storage"]["endpoint"], "sftp.example.com:22");
+        assert_eq!(j1["storage"]["user"], "backupuser");
+        assert_eq!(j1["storage"]["root"], "/remote/logs");
+        assert_eq!(j1["storage"]["known_hosts_strategy"], "strict");
+
+        // Job 2 (crontext used): both crontext and resolved cron set, remote is null
+        let j2 = &jobs[2];
+        assert_eq!(j2["name"], "web");
+        assert_eq!(j2["cron"], "0 18 * * 5");
+        assert_eq!(j2["crontext"], "every friday at 18:00");
+        assert!(j2["remote"].is_null());
+        assert_eq!(j2["storage"]["type"], "fs");
+        assert_eq!(j2["storage"]["root"], "/backup/storage");
+        assert_eq!(j2["storage"]["prefix"], "web");
+        assert_eq!(
+            j2["source"],
             serde_json::json!(["/var/www/html", "/var/www/uploads"])
         );
-
-        // Job 2 (sftp): crontext is null, sftp keys matched
-        let j2 = &jobs[2];
-        assert_eq!(j2["name"], "logs");
-        assert_eq!(j2["cron"], "0 0 * * *");
-        assert!(j2["crontext"].is_null());
-        assert_eq!(j2["storage"]["type"], "sftp");
-        assert_eq!(j2["storage"]["endpoint"], "sftp.example.com:22");
-        assert_eq!(j2["storage"]["user"], "backupuser");
-        assert_eq!(j2["storage"]["root"], "/remote/logs");
-        assert_eq!(j2["storage"]["known_hosts_strategy"], "strict");
     }
 }

@@ -23,49 +23,29 @@
         "region": "eu-west-1",
         "prefix": "db/"
       },
-      "pre": [
-        {
-          "cmd": [
-            "pg_dump"
-          ],
-          "container": "postgres",
-          "timeout_secs": 300
-        }
-      ],
-      "post": [
-        {
-          "cmd": [
-            "/bin/notify.sh"
-          ],
-          "timeout_secs": 60,
-          "run_on": "always"
-        }
-      ],
-      "next_run": "2026-10-02T18:00:00Z",
-      "remote": null
-    },
-    {
-      "name": "web",
-      "cron": "0 18 * * 5",
-      "crontext": "every friday at 18:00",
-      "timezone": "Europe/Berlin",
-      "source": [
-        "/var/www/html",
-        "/var/www/uploads"
-      ],
-      "filename": "web-%Y%m%dT%H%M%SZ.tar.zst",
-      "compression": "zstd",
-      "retention_days": 7,
-      "min_keep": 2,
-      "stop_containers": [],
-      "storage": {
-        "type": "fs",
-        "root": "/backup/storage",
-        "prefix": "web"
+      "pre_backup": {
+        "cmd": [
+          "pg_dump"
+        ],
+        "container": "postgres",
+        "timeout_secs": 300
       },
-      "pre": [],
-      "post": [],
-      "next_run": "2026-10-02T18:00:00+02:00",
+      "post_backup": {
+        "cmd": [
+          "/bin/notify.sh"
+        ],
+        "timeout_secs": 60,
+        "run_on": "always"
+      },
+      "pre_restore": null,
+      "post_restore": {
+        "cmd": [
+          "pg_restore"
+        ],
+        "container": "postgres",
+        "timeout_secs": 1800
+      },
+      "next_run": "2026-10-02T18:00:00Z",
       "remote": null
     },
     {
@@ -88,9 +68,37 @@
         "root": "/remote/logs",
         "known_hosts_strategy": "strict"
       },
-      "pre": [],
-      "post": [],
+      "pre_backup": null,
+      "post_backup": null,
+      "pre_restore": null,
+      "post_restore": null,
       "next_run": "2026-10-03T00:00:00Z",
+      "remote": null
+    },
+    {
+      "name": "web",
+      "cron": "0 18 * * 5",
+      "crontext": "every friday at 18:00",
+      "timezone": "Europe/Berlin",
+      "source": [
+        "/var/www/html",
+        "/var/www/uploads"
+      ],
+      "filename": "web-%Y%m%dT%H%M%SZ.tar.zst",
+      "compression": "zstd",
+      "retention_days": 7,
+      "min_keep": 2,
+      "stop_containers": [],
+      "storage": {
+        "type": "fs",
+        "root": "/backup/storage",
+        "prefix": "web"
+      },
+      "pre_backup": null,
+      "post_backup": null,
+      "pre_restore": null,
+      "post_restore": null,
+      "next_run": "2026-10-02T18:00:00+02:00",
       "remote": null
     }
   ]

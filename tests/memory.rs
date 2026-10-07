@@ -86,10 +86,11 @@ fn job(source: PathBuf, root: PathBuf) -> JobConfig {
             root,
             prefix: "big".to_owned(),
         }),
-        pre: Vec::new(),
-        post: Vec::new(),
+        pre_backup: None,
+        post_backup: None,
         run_on_start: false,
-        restore: None,
+        pre_restore: None,
+        post_restore: None,
     }
 }
 

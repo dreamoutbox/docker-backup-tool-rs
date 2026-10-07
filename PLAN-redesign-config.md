@@ -14,14 +14,15 @@ Redesign the configuration TOML schema to use `[job.<job_name>]` tables, explici
 - Done when: `cargo nextest run --test-threads 1 --fail-fast -p dvb hooks` and `restore` tests pass.
 
 ### Phase 2: Job Table Mapping & Explicit Hook Integration
+- Status: DONE
 - Goal: Migrate config parser to `[job.<name>]` tables without `name` field, wire explicit hook sections, and support name-based environment overrides.
 - Tasks:
-  - [ ] Update `Config` deserializer to parse `[job.<name>]` as a map/dictionary where the map key sets `JobConfig.name`, removing the `name` field from the job table.
-  - [ ] Replace `job.pre`, `job.post`, and `job.restore` in `JobConfig` with `pre_backup: Option<HookConfig>`, `post_backup: Option<HookConfig>`, `pre_restore: Option<HookConfig>`, and `post_restore: Option<RestoreHookConfig>`.
-  - [ ] Update Figment provider configuration in `src/config.rs` to support `DVB__JOB__<NAME>__...` environment overrides, replacing the indexed `[[job]]` normalization.
-  - [ ] Update `JobConfig::validate_static`, `JobConfig::validate_runtime`, and `JobConfig::needs_docker` to validate explicit hooks and Docker socket requirements.
-  - [ ] Update `src/job.rs`, `src/summary.rs`, `src/main.rs`, and `src/init.rs` to consume the new job and hook structures.
-  - [ ] Update unit tests in `src/config.rs` to test the new schema, schedule resolution, validation errors, and environment overrides.
+  - [x] Update `Config` deserializer to parse `[job.<name>]` as a map/dictionary where the map key sets `JobConfig.name`, removing the `name` field from the job table.
+  - [x] Replace `job.pre`, `job.post`, and `job.restore` in `JobConfig` with `pre_backup: Option<HookConfig>`, `post_backup: Option<HookConfig>`, `pre_restore: Option<HookConfig>`, and `post_restore: Option<RestoreHookConfig>`.
+  - [x] Update Figment provider configuration in `src/config.rs` to support `DVB__JOB__<NAME>__...` environment overrides, replacing the indexed `[[job]]` normalization.
+  - [x] Update `JobConfig::validate_static`, `JobConfig::validate_runtime`, and `JobConfig::needs_docker` to validate explicit hooks and Docker socket requirements.
+  - [x] Update `src/job.rs`, `src/summary.rs`, `src/main.rs`, and `src/init.rs` to consume the new job and hook structures.
+  - [x] Update unit tests in `src/config.rs` to test the new schema, schedule resolution, validation errors, and environment overrides.
 - Done when: `cargo nextest run --test-threads 1 --fail-fast -p dvb --lib` passes.
 
 ### Phase 3: Templates, Examples, and Reference Documentation

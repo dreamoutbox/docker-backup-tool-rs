@@ -522,10 +522,11 @@ mod tests {
                 root: PathBuf::from("/tmp"),
                 prefix: "test".to_owned(),
             }),
-            pre: vec![],
-            post: vec![],
+            pre_backup: None,
+            post_backup: None,
             run_on_start,
-            restore: None,
+            pre_restore: None,
+            post_restore: None,
         }
     }
 

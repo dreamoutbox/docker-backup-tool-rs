@@ -158,10 +158,10 @@ fn parse_at_timestamp(s: &str) -> Result<DateTime<Utc>> {
 ///
 /// Rules:
 /// 1. If `--to` is explicitly passed: extract directly to `<dir>`.
-/// 2. If `--to` is omitted and no script is specified: default to `job.restore.dir`.
-///    If `job.restore.dir` is not configured, fail before downloading.
+/// 2. If `--to` is omitted and no script is specified: default to `job.post_restore.dir`.
+///    If `job.post_restore.dir` is not configured, fail before downloading.
 /// 3. If `--to` is omitted and a script is specified: default to
-///    `<job.restore.dir or $DVB_TMP_DIR or temp_dir()>/restore-<job>-<timestamp>`.
+///    `<job.post_restore.dir or $DVB_TMP_DIR or temp_dir()>/restore-<job>-<timestamp>`.
 ///
 /// # Errors
 ///
@@ -177,19 +177,19 @@ pub fn resolve_target_dir(
     }
 
     let effective_script =
-        script.or_else(|| job.restore.as_ref().and_then(|r| r.script.as_deref()));
+        script.or_else(|| job.post_restore.as_ref().and_then(|r| r.script.as_deref()));
 
     if effective_script.is_none() {
-        if let Some(dir) = job.restore.as_ref().and_then(|r| r.dir.as_deref()) {
+        if let Some(dir) = job.post_restore.as_ref().and_then(|r| r.dir.as_deref()) {
             return Ok(dir.to_path_buf());
         }
         return Err(Error::Restore(format!(
-            "no target directory specified for job `{}`: pass `--to <dir>` or configure `[job.restore].dir` in the config file",
+            "no target directory specified for job `{}`: pass `--to <dir>` or configure `[job.<name>.post_restore].dir` in the config file",
             job.name
         )));
     }
 
-    let base_dir = if let Some(dir) = job.restore.as_ref().and_then(|r| r.dir.as_deref()) {
+    let base_dir = if let Some(dir) = job.post_restore.as_ref().and_then(|r| r.dir.as_deref()) {
         dir.to_path_buf()
     } else if let Some(env_tmp) = std::env::var_os("DVB_TMP_DIR") {
         PathBuf::from(env_tmp)
@@ -487,7 +487,7 @@ fn resolve_and_validate_script(
     job: &JobConfig,
     cli_script: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
-    let raw = cli_script.or_else(|| job.restore.as_ref().and_then(|r| r.script.as_deref()));
+    let raw = cli_script.or_else(|| job.post_restore.as_ref().and_then(|r| r.script.as_deref()));
 
     let Some(raw_path) = raw else {
         return Ok(None);
@@ -567,7 +567,7 @@ fn resolve_restore_command(
         }));
     }
 
-    let Some(restore) = job.restore.as_ref() else {
+    let Some(restore) = job.post_restore.as_ref() else {
         return Ok(None);
     };
 
@@ -605,9 +605,10 @@ fn map_process_error(err: crate::hooks::ProcessError) -> ScriptRunError {
         crate::hooks::ProcessError::Cancelled => ScriptRunError::Cancelled,
         crate::hooks::ProcessError::Wait(io) => ScriptRunError::Io(io),
         crate::hooks::ProcessError::Spawn(message)
-        | crate::hooks::ProcessError::Docker(message) => {
-            ScriptRunError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
-        }
+        | crate::hooks::ProcessError::Docker(message) => ScriptRunError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
     }
 }
 
@@ -659,12 +660,17 @@ struct RestoreProcessSpec<'a> {
     docker_socket: Option<&'a Path>,
 }
 
-async fn run_restore_process(spec: RestoreProcessSpec<'_>) -> std::result::Result<(), ScriptRunError> {
+async fn run_restore_process(
+    spec: RestoreProcessSpec<'_>,
+) -> std::result::Result<(), ScriptRunError> {
     let env: Vec<(String, String)> = [
         ("DVB_JOB", spec.job.name.as_str()),
         ("DVB_RESTORE_DIR", spec.target.to_str().unwrap_or("")),
         ("DVB_ARCHIVE", spec.backup.path.as_str()),
-        ("DVB_ARCHIVE_TIME", spec.backup.timestamp.to_rfc3339().as_str()),
+        (
+            "DVB_ARCHIVE_TIME",
+            spec.backup.timestamp.to_rfc3339().as_str(),
+        ),
     ]
     .iter()
     .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
@@ -724,7 +730,7 @@ async fn execute_restore_hook(
 ) -> Result<u8> {
     let timeout_secs = options
         .script_timeout
-        .or_else(|| job.restore.as_ref().map(|r| r.timeout_secs))
+        .or_else(|| job.post_restore.as_ref().map(|r| r.timeout_secs))
         .unwrap_or(3600);
 
     let stop_guard = if options.stop_containers {
@@ -752,7 +758,10 @@ async fn execute_restore_hook(
         dir: resolved.dir,
     };
 
-    let container = job.restore.as_ref().and_then(|r| r.container.as_deref());
+    let container = job
+        .post_restore
+        .as_ref()
+        .and_then(|r| r.container.as_deref());
     let script_res = run_restore_process(RestoreProcessSpec {
         command: &command,
         target: target_path,
@@ -1259,15 +1268,15 @@ mod tests {
         let res = resolve_target_dir(&job, Some(to), None, time).unwrap();
         assert_eq!(res, PathBuf::from("/custom/path"));
 
-        // 2. No script, no job.restore.dir -> error
+        // 2. No script, no job.post_restore.dir -> error
         let err = resolve_target_dir(&job, None, None, time).unwrap_err();
         assert!(
             err.to_string().contains("no target directory specified"),
             "{err}"
         );
 
-        // 3. No script, job.restore.dir configured -> default to job.restore.dir
-        job.restore = Some(crate::config::RestoreHookConfig {
+        // 3. No script, job.post_restore.dir configured -> default to job.post_restore.dir
+        job.post_restore = Some(crate::config::RestoreHookConfig {
             dir: Some(PathBuf::from("/configured/restore")),
             script: None,
             cmd: Some(vec!["/scripts/pg_restore.sh".to_owned()]),
@@ -1309,10 +1318,14 @@ mod tests {
         assert!(resolve_restore_command(&job, None).unwrap().is_none());
 
         // A configured `cmd` resolves its first element as the program.
-        job.restore = Some(crate::config::RestoreHookConfig {
+        job.post_restore = Some(crate::config::RestoreHookConfig {
             dir: Some(PathBuf::from("/restore")),
             script: None,
-            cmd: Some(vec!["pg_restore".to_owned(), "-d".to_owned(), "db".to_owned()]),
+            cmd: Some(vec![
+                "pg_restore".to_owned(),
+                "-d".to_owned(),
+                "db".to_owned(),
+            ]),
             container: None,
             timeout_secs: 60,
         });
@@ -1321,7 +1334,10 @@ mod tests {
         };
         assert_eq!(resolved.program, "pg_restore");
         assert_eq!(resolved.base_args, vec!["-d".to_owned(), "db".to_owned()]);
-        assert!(!resolved.inject_target, "cmd restore should not inject the target arg");
+        assert!(
+            !resolved.inject_target,
+            "cmd restore should not inject the target arg"
+        );
         assert_eq!(resolved.dir.as_deref(), Some(Path::new("/restore")));
     }
 
@@ -1342,7 +1358,10 @@ mod tests {
             program: "/bin/sh".to_owned(),
             args: vec![
                 "-c".to_owned(),
-                format!("printf '%s:%s' \"$1\" \"$DVB_RESTORE_DIR\" > {}\n", written.display()),
+                format!(
+                    "printf '%s:%s' \"$1\" \"$DVB_RESTORE_DIR\" > {}\n",
+                    written.display()
+                ),
             ],
             dir: None,
         };

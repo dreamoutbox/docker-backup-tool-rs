@@ -195,7 +195,7 @@ async fn run_backup_locked(
     // 1. Pre hooks. A failure here means nothing has been stopped, and the post
     //    hooks still get their turn with status=failure.
     let pending = hooks_ctx(Status::Pending, "");
-    if let Err(err) = hooks::run(Phase::Pre, &job.pre, &pending, client).await {
+    if let Err(err) = hooks::run(Phase::Pre, job.pre_backup.as_slice(), &pending, client).await {
         tracing::error!(error = %err, "pre hook failed; the backup was not taken");
         let failed_at = err.to_string();
         abort(job, &remote, &mut guard, client, &failed_at).await;
@@ -243,7 +243,7 @@ async fn run_backup_locked(
     };
     let post = hooks::run(
         Phase::Post,
-        &job.post,
+        job.post_backup.as_slice(),
         &hooks_ctx(hook_status, &error),
         client,
     )
@@ -326,7 +326,7 @@ async fn abort(
         archive: remote,
         error: reason,
     };
-    if let Err(err) = hooks::run(Phase::Post, &job.post, &ctx, client).await {
+    if let Err(err) = hooks::run(Phase::Post, job.post_backup.as_slice(), &ctx, client).await {
         tracing::error!(error = %err, "a post hook failed after an aborted backup");
     }
 }
@@ -469,10 +469,11 @@ mod tests {
                 root: root.to_path_buf(),
                 prefix: "backups".to_owned(),
             }),
-            pre: vec![],
-            post: vec![],
+            pre_backup: None,
+            post_backup: None,
             run_on_start: false,
-            restore: None,
+            pre_restore: None,
+            post_restore: None,
         }
     }
 

@@ -139,13 +139,8 @@ async fn run_one(
     client: Option<&docker::Client>,
 ) -> Result<()> {
     let env = ctx.env();
-    let command = Command::resolve(
-        hook.cmd.as_ref(),
-        hook.script.as_ref(),
-        &[],
-        None,
-    )
-    .ok_or_else(|| hook_failed(hook, "no `cmd` or `script` configured"))?;
+    let command = Command::resolve(hook.cmd.as_ref(), hook.script.as_ref(), &[], None)
+        .ok_or_else(|| hook_failed(hook, "no `cmd` or `script` configured"))?;
     if command.is_empty() {
         return Err(hook_failed(hook, "empty command"));
     }
@@ -201,7 +196,11 @@ impl Command {
             // An empty vector is resolved here so the caller can report it as
             // such rather than trying to spawn an empty program.
             let Some(program) = cmd_vec.first().cloned() else {
-                return Some(Self { program: String::new(), args: Vec::new(), dir });
+                return Some(Self {
+                    program: String::new(),
+                    args: Vec::new(),
+                    dir,
+                });
             };
             let mut args = cmd_vec[1..].to_vec();
             args.extend(extra.iter().cloned());
@@ -278,14 +277,9 @@ pub async fn run_local(
         proc.current_dir(dir);
     }
 
-    let mut child = proc
-        .spawn()
-        .map_err(|source| {
-            ProcessError::Spawn(format!(
-                "cannot start `{}`: {source}",
-                command.program
-            ))
-        })?;
+    let mut child = proc.spawn().map_err(|source| {
+        ProcessError::Spawn(format!("cannot start `{}`: {source}", command.program))
+    })?;
 
     // Piped output must be drained while the child runs, or a hook that writes
     // more than a pipe's worth blocks forever waiting for us to read it.
@@ -371,13 +365,13 @@ pub async fn run_container(
 }
 
 /// Translate a child's exit status into an exit code.
-    fn exit_code(status: ExitStatus) -> i64 {
-        if status.success() {
-            0
-        } else {
-            i64::from(status.code().unwrap_or(-1))
-        }
+fn exit_code(status: ExitStatus) -> i64 {
+    if status.success() {
+        0
+    } else {
+        i64::from(status.code().unwrap_or(-1))
     }
+}
 
 /// Forward one of the child's pipes to the log, line by line.
 pub(crate) async fn pump<R>(reader: Option<R>, stream: &'static str)
@@ -637,16 +631,24 @@ mod tests {
         let marker = tempfile::tempdir().expect("tempdir");
         let written = marker.path().join("seen");
         let script = marker.path().join("hook.sh");
-        std::fs::write (
+        std::fs::write(
             &script,
-            format!("#!/bin/sh\necho $DVB_JOB:$DVB_STATUS > {}\n", written.display()),
+            format!(
+                "#!/bin/sh\necho $DVB_JOB:$DVB_STATUS > {}\n",
+                written.display()
+            ),
         )
         .expect("write script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        run(Phase::Pre, &[script_hook(&script)], &ctx(Status::Pending), None)
-            .await
-            .expect("script hook");
+        run(
+            Phase::Pre,
+            &[script_hook(&script)],
+            &ctx(Status::Pending),
+            None,
+        )
+        .await
+        .expect("script hook");
 
         let seen = std::fs::read_to_string(&written).expect("marker");
         assert_eq!(seen.trim(), "db:pending");
@@ -659,9 +661,14 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nexit 9\n").expect("write script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        let err = run(Phase::Pre, &[script_hook(&script)], &ctx(Status::Pending), None)
-            .await
-            .unwrap_err();
+        let err = run(
+            Phase::Pre,
+            &[script_hook(&script)],
+            &ctx(Status::Pending),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("exit code 9"), "{err}");
     }
 
