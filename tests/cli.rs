@@ -70,11 +70,10 @@ fn env_override_crontext() {
         &config_path,
         format!(
             r#"
-[[job]]
-name = "db"
+[job.db]
 source = ["{}"]
 filename = "db-%Y%m%dT%H%M%SZ"
-  [job.storage]
+  [job.db.storage]
   type = "fs"
   root = "{}"
 "#,
@@ -86,7 +85,7 @@ filename = "db-%Y%m%dT%H%M%SZ"
 
     let assert = dvb()
         .args(["check", "--config", config_path.to_str().unwrap()])
-        .env("DVB__JOB__0__CRONTEXT", "every 15 minutes")
+        .env("DVB__JOB__DB__CRONTEXT", "every 15 minutes")
         .assert();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
@@ -132,14 +131,13 @@ fn init_stdout_writes_pure_toml_and_stderr_has_no_config() {
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
 
     assert_ne!(stdout, "");
-    assert!(stdout.contains("[[job]]"));
-    assert!(stdout.contains("name = \"backup\""));
+    assert!(stdout.contains("[job.backup]"));
     // Stdout must parse as valid TOML
     let parsed: toml::Value = toml::from_str(&stdout).expect("stdout must be valid TOML");
     assert!(parsed.get("job").is_some());
 
     // Stderr must not contain config data
-    assert!(!stderr.contains("[[job]]"));
+    assert!(!stderr.contains("[job.backup]"));
 }
 
 #[test]
@@ -160,7 +158,7 @@ fn init_file_creation_overwrite_protection_and_force() {
     assert!(out_path.exists());
 
     let original_content = std::fs::read_to_string(&out_path).expect("read file");
-    assert!(original_content.contains("[[job]]"));
+    assert!(original_content.contains("[job.backup]"));
 
     // Modify file
     std::fs::write(&out_path, "modified = true\n").expect("modify file");

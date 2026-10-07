@@ -34,13 +34,13 @@ fn e2e_init_edit_jobs_check_backup_remote() {
     let raw_toml = fs::read_to_string(&config_path).expect("read generated config");
     let mut doc: DocumentMut = raw_toml.parse().expect("parse toml with toml_edit");
 
-    // Update job source
-    let job = doc["job"].get_mut(0).expect("first job");
+    // Update job source. The reference template declares `[job.backup]`.
+    let job = doc["job"].get_mut("backup").expect("backup job");
     let mut sources = Array::new();
     sources.push(data_dir.to_str().unwrap());
     job["source"] = Item::Value(TomlValue::Array(sources));
 
-    // Replace job.storage with fs backend
+    // Replace job storage with the fs backend (`[job.backup.storage]`).
     let mut storage_tbl = Table::new();
     storage_tbl.insert("type", Item::Value("fs".into()));
     storage_tbl.insert("root", Item::Value(storage_dir.to_str().unwrap().into()));

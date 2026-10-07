@@ -36,14 +36,17 @@ Redesign the configuration TOML schema to use `[job.<job_name>]` tables, explici
 - Done when: `cargo test --doc` and `dvb init` validation tests pass.
 
 ### Phase 4: Test Fixtures, Golden Outputs, and Integration Tests
+- Status: DONE
 - Goal: Update all test fixtures, golden files, and end-to-end integration tests to the new schema.
 - Tasks:
-  - [ ] Update `tests/fixtures/jobs_fixture.toml` to use `[job.<name>]` and explicit hook names.
-  - [ ] Update `tests/golden/jobs_json.golden` to reflect updated summary JSON keys (`pre_backup`, `post_backup`, `post_restore`).
-  - [ ] Update inline TOML fixtures in `tests/cli.rs`, `tests/jobs_cli.rs`, `tests/docker_hooks.rs`, `tests/e2e_fs.rs`, `tests/s3_test.rs`, `tests/sftp.rs`, and `tests/memory.rs`.
-  - [ ] Add integration tests covering containerized hook execution for both `script` and `cmd` in `pre_backup` and `post_restore`.
-  - [ ] Run full test suite and verify no regressions.
+  - [x] Update `tests/fixtures/jobs_fixture.toml` to use `[job.<name>]` and explicit hook names.
+  - [x] Update `tests/golden/jobs_json.golden` to reflect updated summary JSON keys (`pre_backup`, `post_backup`, `post_restore`).
+  - [x] Update inline TOML fixtures in `tests/cli.rs`, `tests/jobs_cli.rs`, `tests/docker_hooks.rs`, `tests/e2e_fs.rs`, `tests/s3_test.rs`, `tests/sftp.rs`, and `tests/memory.rs`.
+  - [x] Add integration tests covering containerized hook execution for both `script` and `cmd` in `pre_backup` and `post_restore`.
+  - [x] Run full test suite and verify no regressions.
 - Done when: `CI=1 cargo nextest run --test-threads 1 --fail-fast` passes on all 227+ tests.
+
+> Note: `tests/fixtures/jobs_fixture.toml` and `tests/golden/jobs_json.golden` were already migrated in Phase 2 because several `--lib` tests (`jobs::*`) read them directly.
 
 ---
 

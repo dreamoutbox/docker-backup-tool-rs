@@ -102,12 +102,11 @@ fn jobs_ignores_missing_sources_and_touches_no_docker_or_locks() {
     std::fs::write(
         &config_path,
         r#"
-[[job]]
-name = "standalone"
+[job.standalone]
 cron = "0 3 * * *"
 source = ["/completely/nonexistent/path/12345"]
 filename = "bk-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.standalone.storage]
   type = "fs"
   root = "/tmp"
 "#,
@@ -152,39 +151,36 @@ fn secret_leak_prevention_on_cli_output() {
 [docker]
 socket = "/var/run/docker.sock"
 
-[[job]]
-name = "s3job"
+[job.s3job]
 cron = "0 3 * * *"
 source = ["/data"]
 filename = "s3-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.s3job.storage]
   type = "s3"
   bucket = "mybucket"
   region = "us-east-1"
   access_key_id = "{}"
   secret_access_key = "{}"
-  [[job.pre]]
+  [job.s3job.pre_backup]
   cmd = ["pg_dump", "{}"]
   container = "postgres"
 
-[[job]]
-name = "sftpjob"
+[job.sftpjob]
 cron = "0 4 * * *"
 source = ["/data"]
 filename = "sftp-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.sftpjob.storage]
   type = "sftp"
   endpoint = "sftp.example.com:22"
   user = "backupuser"
   root = "/remote"
   key_path = "{}"
 
-[[job]]
-name = "dropboxjob"
+[job.dropboxjob]
 cron = "0 5 * * *"
 source = ["/data"]
 filename = "dbx-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.dropboxjob.storage]
   type = "dropbox"
   root = "/backups"
   client_id = "{}"
@@ -275,12 +271,11 @@ fn remote_stats_against_fs_backend() {
         &config_path,
         format!(
             r#"
-[[job]]
-name = "data"
+[job.data]
 cron = "0 3 * * *"
 source = ["/dummy"]
 filename = "data-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.data.storage]
   type = "fs"
   root = "{}"
   prefix = "bk"
@@ -337,21 +332,19 @@ fn remote_unreachable_backend_populates_error_and_exits_2() {
         &config_path,
         format!(
             r#"
-[[job]]
-name = "job1"
+[job.job1]
 cron = "0 1 * * *"
 source = ["/dummy"]
 filename = "j1-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.job1.storage]
   type = "fs"
   root = "{}"
 
-[[job]]
-name = "job2_bad"
+[job.job2_bad]
 cron = "0 2 * * *"
 source = ["/dummy"]
 filename = "j2-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.job2_bad.storage]
   type = "s3"
   bucket = "badbucket"
   region = "us-east-1"
@@ -359,12 +352,11 @@ filename = "j2-%Y%m%dT%H%M%SZ.tar.zst"
   access_key_id = "test"
   secret_access_key = "test"
 
-[[job]]
-name = "job3"
+[job.job3]
 cron = "0 3 * * *"
 source = ["/dummy"]
 filename = "j3-%Y%m%dT%H%M%SZ.tar.zst"
-  [job.storage]
+  [job.job3.storage]
   type = "fs"
   root = "{}"
 "#,
