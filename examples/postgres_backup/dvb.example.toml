@@ -41,14 +41,7 @@ timeout_secs = 3600
 [job.db.post_restore]
 # Default extraction target directory
 dir = "/restore"
-cmd = [
-    "pg_restore",
-    "-U",
-    "postgres",
-    "-d",
-    "app",
-    "--clean",
-    "--if-exists",
-]
-container = "db"
+# The script locates the dump file (plain SQL here) inside the extracted
+# directory and pipes it into the 'db' container via docker exec.
+script = "/scripts/pg_restore.sh"
 timeout_secs = 3600

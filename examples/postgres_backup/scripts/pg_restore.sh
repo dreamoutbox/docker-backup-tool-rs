@@ -139,7 +139,21 @@ fi
 echo "Found dump file: $DUMP_FILE (type: $DUMP_TYPE)"
 
 # 4. Perform restore
-if command -v psql >/dev/null 2>&1 || command -v pg_restore >/dev/null 2>&1; then
+#
+# Prefer executing psql/pg_restore inside the PostgreSQL container via the
+# Docker socket. This avoids host/network reachability issues entirely (e.g.
+# Docker-in-Docker environments that block container-to-container traffic, see
+# post-mortem/2026-10-07-codespaces-dind-blocks-container-to-container-s3.md)
+# and matches how the pre-backup hook runs pg_dump.
+if command -v docker >/dev/null 2>&1 && [ -S "/var/run/docker.sock" ]; then
+    # Mode B: Docker CLI and socket available, pipe into running PostgreSQL container
+    echo "Executing psql/pg_restore inside container '$POSTGRES_CONTAINER' via docker..."
+    if [ "$DUMP_TYPE" = "custom" ]; then
+        docker exec -i "$POSTGRES_CONTAINER" pg_restore -U "$PGUSER" -d "$PGDATABASE" --no-owner --clean --if-exists "$@" < "$DUMP_FILE"
+    else
+        docker exec -i "$POSTGRES_CONTAINER" psql -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 "$@" < "$DUMP_FILE"
+    fi
+elif command -v psql >/dev/null 2>&1 || command -v pg_restore >/dev/null 2>&1; then
     # Mode A: Native PostgreSQL client utilities available
     if [ "$DUMP_TYPE" = "custom" ]; then
         if ! command -v pg_restore >/dev/null 2>&1; then
@@ -165,14 +179,6 @@ if command -v psql >/dev/null 2>&1 || command -v pg_restore >/dev/null 2>&1; the
             export PGHOST PGPORT PGUSER PGDATABASE
             psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 "$@" -f "$DUMP_FILE"
         fi
-    fi
-elif command -v docker >/dev/null 2>&1 && [ -S "/var/run/docker.sock" ]; then
-    # Mode B: Docker CLI and socket available, pipe into running PostgreSQL container
-    echo "Local postgres utilities not found; executing inside container '$POSTGRES_CONTAINER' via docker..."
-    if [ "$DUMP_TYPE" = "custom" ]; then
-        docker exec -i "$POSTGRES_CONTAINER" pg_restore -U "$PGUSER" -d "$PGDATABASE" --no-owner --clean --if-exists "$@" < "$DUMP_FILE"
-    else
-        docker exec -i "$POSTGRES_CONTAINER" psql -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 "$@" < "$DUMP_FILE"
     fi
 else
     echo "ERROR: Neither PostgreSQL client tools (psql / pg_restore) nor Docker CLI were found in PATH." >&2
