@@ -1,8 +1,7 @@
 [docker]
 socket = "/var/run/docker.sock"
 
-[[job]]
-name = "db"
+[job.db]
 cron = "0 3 * * *"                         # Every day at 03:00 UTC
 run_on_start = true                        # Take an initial backup when the daemon starts
 source = ["/backup/pgdump"]
@@ -11,10 +10,20 @@ compression = "zstd"
 retention_days = 14
 min_keep = 3
 
+[job.db.storage]
+type = "s3"
+bucket = "dvb"
+region = "us-east-1"
+endpoint = "http://s3:8333"
+prefix = "db"
+access_key_id = "dvbtest"
+secret_access_key = "dvbtest-secret"
+force_path_style = true
+
 # Pre-backup hook: dvb runs pg_dump via `docker exec` inside the 'db' container.
 # Output goes directly to /backup/pgdump/dump.sql on the shared staging volume.
 # No docker CLI or external tools needed in the dvb container itself.
-[[job.pre]]
+[job.db.pre_backup]
 cmd = [
     "pg_dump",
     "-U",
@@ -29,18 +38,17 @@ cmd = [
 container = "db"
 timeout_secs = 3600
 
-[job.storage]
-type = "s3"
-bucket = "dvb"
-region = "us-east-1"
-endpoint = "http://s3:8333"
-prefix = "db"
-access_key_id = "dvbtest"
-secret_access_key = "dvbtest-secret"
-force_path_style = true
-
-[job.restore]
+[job.db.post_restore]
 # Default extraction target directory
 dir = "/restore"
-# script = "/scripts/pg_restore.sh"         # Uncomment if psql or docker CLI is available in the dvb image
-script_timeout_secs = 3600
+cmd = [
+    "pg_restore",
+    "-U",
+    "postgres",
+    "-d",
+    "app",
+    "--clean",
+    "--if-exists",
+]
+container = "db"
+timeout_secs = 3600

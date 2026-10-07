@@ -26,12 +26,13 @@ Redesign the configuration TOML schema to use `[job.<job_name>]` tables, explici
 - Done when: `cargo nextest run --test-threads 1 --fail-fast -p dvb --lib` passes.
 
 ### Phase 3: Templates, Examples, and Reference Documentation
+- Status: DONE
 - Goal: Update reference templates, example stacks, and sample configs to conform to the new schema.
 - Tasks:
-  - [ ] Update `templates/dvb.toml` with `[job.backup]`, `[job.backup.storage]`, `[job.backup.pre_backup]`, and `[job.backup.post_restore]`.
-  - [ ] Update `examples/postgres_backup/dvb.example.toml` and `examples/postgres_backup_dropbox/dvb.example.toml` to the new schema.
-  - [ ] Align `dvb.new.toml` by commenting out alternate options (`# script = ...` vs `cmd = [...]`) to ensure it is valid TOML.
-  - [ ] Update CLI help and documentation referencing config structure where applicable.
+  - [x] Update `templates/dvb.toml` with `[job.backup]`, `[job.backup.storage]`, `[job.backup.pre_backup]`, and `[job.backup.post_restore]`.
+  - [x] Update `examples/postgres_backup/dvb.example.toml` and `examples/postgres_backup_dropbox/dvb.example.toml` to the new schema.
+  - [x] Align `dvb.new.toml` by commenting out alternate options (`# script = ...` vs `cmd = [...]`) to ensure it is valid TOML.
+  - [x] Update CLI help and documentation referencing config structure where applicable.
 - Done when: `cargo test --doc` and `dvb init` validation tests pass.
 
 ### Phase 4: Test Fixtures, Golden Outputs, and Integration Tests

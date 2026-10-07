@@ -689,7 +689,7 @@ impl Config {
     /// [`ConfigError::Invalid`] naming the first missing path or unreadable file.
     pub fn validate_runtime(&self) -> Result<()> {
         if self.jobs.is_empty() {
-            return Err(invalid("no [[job]] defined"));
+            return Err(invalid("no [job.<name>] defined"));
         }
         for job in &self.jobs {
             job.validate_runtime(&self.docker)?;

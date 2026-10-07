@@ -26,7 +26,7 @@ container = "db"
 # timeout execute command/script
 timeout_secs = 3600
 # Run script
-script = "/scripts/pg_restore.sh"
+# script = "/scripts/pg_restore.sh"
 # OR run cmd
 cmd = [
     "pg_dump",
@@ -48,7 +48,7 @@ dir = "/backup"
 # timeout execute command/script
 timeout_secs = 3600
 # Run script
-script = "/scripts/pg_restore.sh"
+# script = "/scripts/pg_restore.sh"
 # OR run cmd
 cmd = [
     "pg_restore",

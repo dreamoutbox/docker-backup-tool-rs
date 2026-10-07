@@ -587,7 +587,7 @@ mod tests {
             .expect("runtime")
             .block_on(dispatch(&cli))
             .unwrap_err();
-        assert!(format!("{err:#}").contains("no [[job]] defined"));
+        assert!(format!("{err:#}").contains("no [job.<name>] defined"));
     }
 
     #[test]
