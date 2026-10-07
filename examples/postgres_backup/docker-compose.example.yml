@@ -110,7 +110,7 @@ services:
       - DVB_LOG=dvb=info
       # Override the endpoint from dvb.example.toml (which uses http://s3:8333)
       # so the job talks to SeaweedFS via the host's published 8333 port.
-      - DVB__JOB__0__STORAGE__ENDPOINT=http://host.docker.internal:8333
+      - DVB__JOB__DB__STORAGE__ENDPOINT=http://host.docker.internal:8333
       # Passed through to pg_backup.sh
       - PGPASSWORD=postgrespassword
       # Dropbox
