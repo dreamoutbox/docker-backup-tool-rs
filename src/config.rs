@@ -368,7 +368,7 @@ impl StorageConfig {
             Self::Fs(cfg) => &cfg.prefix,
             Self::S3(cfg) => &cfg.prefix,
             Self::Sftp(cfg) => &cfg.root,
-            Self::Dropbox(cfg) => &cfg.root,
+            Self::Dropbox(cfg) => &cfg.prefix,
         }
     }
 
@@ -417,15 +417,6 @@ impl StorageConfig {
             Self::Dropbox(cfg) => {
                 if cfg.root.trim().is_empty() {
                     return Err(invalid("dropbox storage requires a non-empty `root`"));
-                }
-                if cfg.client_id.is_empty() {
-                    return Err(invalid("dropbox storage requires `client_id`"));
-                }
-                if cfg.client_secret.is_empty() {
-                    return Err(invalid("dropbox storage requires `client_secret`"));
-                }
-                if cfg.refresh_token.is_empty() {
-                    return Err(invalid("dropbox storage requires `refresh_token`"));
                 }
             }
         }
@@ -504,16 +495,31 @@ pub enum KnownHostsStrategy {
 }
 
 /// `dropbox` backend settings.
-///
-/// Parsed and validated in phase 1; the operator is built in phase 5.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct DropboxConfig {
     /// Folder in the Dropbox account that acts as the archive root.
+    #[serde(default = "default_dropbox_root")]
     pub root: String,
-    pub client_id: SecretString,
-    pub client_secret: SecretString,
-    pub refresh_token: SecretString,
+    /// Key prefix prepended to object names inside `root`.
+    #[serde(default)]
+    pub prefix: String,
+    /// Direct access token or developer key.
+    #[serde(default)]
+    pub token: Option<SecretString>,
+    /// Dropbox OAuth client ID (used with `refresh_token`).
+    #[serde(default)]
+    pub client_id: Option<SecretString>,
+    /// Dropbox OAuth client secret (used with `refresh_token`).
+    #[serde(default)]
+    pub client_secret: Option<SecretString>,
+    /// Dropbox OAuth refresh token (for long-lived access).
+    #[serde(default)]
+    pub refresh_token: Option<SecretString>,
+}
+
+fn default_dropbox_root() -> String {
+    std::env::var("DROPBOX_ROOT").unwrap_or_else(|_| "/".to_owned())
 }
 
 /// A secret string that never shows up in logs.

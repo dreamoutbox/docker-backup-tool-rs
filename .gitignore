@@ -30,3 +30,6 @@ recipe.json
 handoff.md
 
 fail-tests-ci/
+
+opendal-dropbox-example/
+local-test/

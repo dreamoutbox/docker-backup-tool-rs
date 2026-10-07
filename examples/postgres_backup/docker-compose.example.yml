@@ -103,3 +103,9 @@ services:
       - DVB_LOG=dvb=info
       # Passed through to pg_backup.sh
       - PGPASSWORD=postgrespassword
+      # Dropbox
+      # - DROPBOX_TOKEN=
+      # - DROPBOX_CLIENT_ID=
+      # - DROPBOX_CLIENT_SECRET=
+      # - DROPBOX_REFRESH_TOKEN=
+      # - DROPBOX_ROOT=

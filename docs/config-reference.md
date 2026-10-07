@@ -190,10 +190,14 @@ refresh_token = "/run/secrets/dropbox_refresh_token"
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `type` | string | `"dropbox"` | Backend identifier. |
-| `root` | string | *Required* | Destination directory in Dropbox. |
-| `client_id` | string | *Required* | Dropbox OAuth app client ID. |
-| `client_secret` | string | *Required* | Dropbox OAuth app client secret. |
-| `refresh_token` | string | *Required* | OAuth refresh token. |
+| `root` | string | `"/"` | Destination directory in Dropbox (or via `DROPBOX_ROOT`). |
+| `prefix` | string | `""` | Subdirectory prefix inside `root`. |
+| `token` | string | *Ambient* | Dropbox access token / developer key (or via `DROPBOX_TOKEN`). |
+| `client_id` | string | *Ambient* | Dropbox OAuth app client ID (or via `DROPBOX_CLIENT_ID`). |
+| `client_secret` | string | *Ambient* | Dropbox OAuth app client secret (or via `DROPBOX_CLIENT_SECRET`). |
+| `refresh_token` | string | *Ambient* | OAuth refresh token (or via `DROPBOX_REFRESH_TOKEN`). |
+
+Either `token` (direct access token) or the complete OAuth refresh triplet (`client_id`, `client_secret`, `refresh_token`) is required. If omitted in `dvb.toml`, credentials will be read from the respective environment variables (`DROPBOX_TOKEN`, `DROPBOX_CLIENT_ID`, `DROPBOX_CLIENT_SECRET`, `DROPBOX_REFRESH_TOKEN`).
 
 ---
 

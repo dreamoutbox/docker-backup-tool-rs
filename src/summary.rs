@@ -78,6 +78,8 @@ pub enum StorageSummary {
     },
     Dropbox {
         root: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        prefix: String,
     },
 }
 
@@ -104,6 +106,7 @@ impl StorageSummary {
             },
             StorageConfig::Dropbox(cfg) => Self::Dropbox {
                 root: cfg.root.clone(),
+                prefix: cfg.prefix.clone(),
             },
         }
     }
@@ -133,9 +136,14 @@ impl StorageSummary {
                 let clean = root.trim_start_matches('/');
                 format!("sftp://{user}@{endpoint}/{clean}")
             }
-            Self::Dropbox { root } => {
-                let clean = root.trim_start_matches('/');
-                format!("dropbox:/{clean}")
+            Self::Dropbox { root, prefix } => {
+                let clean_root = root.trim_start_matches('/');
+                let clean_prefix = prefix.trim_start_matches('/');
+                if clean_prefix.is_empty() {
+                    format!("dropbox:/{clean_root}")
+                } else {
+                    format!("dropbox:/{clean_root}/{clean_prefix}")
+                }
             }
         }
     }
@@ -349,9 +357,11 @@ mod tests {
             follow_symlinks: false,
             storage: StorageConfig::Dropbox(DropboxConfig {
                 root: "/dbx/backups".to_owned(),
-                client_id: SecretString::new(id),
-                client_secret: SecretString::new(secret),
-                refresh_token: SecretString::new(refresh),
+                prefix: String::new(),
+                token: None,
+                client_id: Some(SecretString::new(id)),
+                client_secret: Some(SecretString::new(secret)),
+                refresh_token: Some(SecretString::new(refresh)),
             }),
             pre: vec![],
             post: vec![],
@@ -536,6 +546,7 @@ mod tests {
 
         let dropbox = StorageSummary::Dropbox {
             root: "/backups/db".to_owned(),
+            prefix: String::new(),
         };
         assert_eq!(dropbox.location(), "dropbox:/backups/db");
     }

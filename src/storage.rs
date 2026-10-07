@@ -69,11 +69,7 @@ pub fn operator(config: &StorageConfig) -> Result<Operator> {
         StorageConfig::Fs(cfg) => fs_operator(cfg)?,
         StorageConfig::S3(cfg) => s3_operator(cfg)?,
         StorageConfig::Sftp(cfg) => sftp_operator(cfg)?,
-        StorageConfig::Dropbox(_) => {
-            return Err(Error::StorageConfig(
-                "the dropbox backend is not wired up yet".to_owned(),
-            ));
-        }
+        StorageConfig::Dropbox(cfg) => dropbox_operator(cfg)?,
     };
 
     Ok(op
@@ -180,6 +176,98 @@ fn sftp_operator(cfg: &crate::config::SftpConfig) -> Result<Operator> {
         backend: "sftp",
         source,
     })
+}
+
+fn dropbox_operator(cfg: &crate::config::DropboxConfig) -> Result<Operator> {
+    dropbox_operator_with(cfg, |k| std::env::var(k).ok())
+}
+
+fn dropbox_operator_with<F>(cfg: &crate::config::DropboxConfig, lookup_env: F) -> Result<Operator>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    install_transport()?;
+
+    let mut builder = opendal::services::Dropbox::default();
+    builder = builder.root(&cfg.root);
+
+    let token = resolve_credential_with(cfg.token.as_ref(), "DROPBOX_TOKEN", &lookup_env)
+        .or_else(|| resolve_credential_with(None, "DROPBOX_ACCESS_TOKEN", &lookup_env));
+    let client_id =
+        resolve_credential_with(cfg.client_id.as_ref(), "DROPBOX_CLIENT_ID", &lookup_env);
+    let client_secret = resolve_credential_with(
+        cfg.client_secret.as_ref(),
+        "DROPBOX_CLIENT_SECRET",
+        &lookup_env,
+    );
+    let refresh_token = resolve_credential_with(
+        cfg.refresh_token.as_ref(),
+        "DROPBOX_REFRESH_TOKEN",
+        &lookup_env,
+    );
+
+    if let Some(tok) = cfg
+        .token
+        .as_ref()
+        .map(|s| s.expose().trim())
+        .filter(|s| !s.is_empty())
+    {
+        builder = builder.access_token(tok);
+    } else if let (Some(refresh), Some(id), Some(secret)) =
+        (&refresh_token, &client_id, &client_secret)
+    {
+        builder = builder
+            .refresh_token(refresh)
+            .client_id(id)
+            .client_secret(secret);
+    } else if let Some(tok) = &token {
+        builder = builder.access_token(tok);
+    } else if client_id.is_some() || client_secret.is_some() || refresh_token.is_some() {
+        let mut missing = Vec::new();
+        if client_id.is_none() {
+            missing.push("client_id (or DROPBOX_CLIENT_ID)");
+        }
+        if client_secret.is_none() {
+            missing.push("client_secret (or DROPBOX_CLIENT_SECRET)");
+        }
+        if refresh_token.is_none() {
+            missing.push("refresh_token (or DROPBOX_REFRESH_TOKEN)");
+        }
+        return Err(Error::StorageConfig(format!(
+            "dropbox OAuth refresh flow is missing required credentials: {}",
+            missing.join(", ")
+        )));
+    } else {
+        return Err(Error::StorageConfig(
+            "dropbox storage requires credentials: provide `token` (or DROPBOX_TOKEN) or (`client_id`, `client_secret`, `refresh_token` / DROPBOX_CLIENT_ID, DROPBOX_CLIENT_SECRET, DROPBOX_REFRESH_TOKEN)".to_owned(),
+        ));
+    }
+
+    Operator::new(builder).map_err(|source| Error::Storage {
+        backend: "dropbox",
+        source,
+    })
+}
+
+fn resolve_credential_with<'a, F>(
+    config_val: Option<&'a crate::config::SecretString>,
+    env_var: &str,
+    lookup_env: &F,
+) -> Option<std::borrow::Cow<'a, str>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(s) = config_val
+        .map(|s| s.expose().trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(std::borrow::Cow::Borrowed(s))
+    } else {
+        lookup_env(env_var)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .map(std::borrow::Cow::Owned)
+    }
 }
 
 /// Normalise a configured SFTP endpoint for the `ssh` client.
@@ -572,18 +660,107 @@ mod tests {
     }
 
     #[test]
-    fn dropbox_is_still_reported_as_unimplemented() {
+    fn dropbox_operator_builds_with_token_in_config() {
         let cfg = StorageConfig::Dropbox(crate::config::DropboxConfig {
             root: "/dvb".to_owned(),
-            client_id: SecretString::new("id"),
-            client_secret: SecretString::new("secret"),
-            refresh_token: SecretString::new("token"),
+            prefix: String::new(),
+            token: Some(SecretString::new("test-token")),
+            client_id: None,
+            client_secret: None,
+            refresh_token: None,
         });
-        let err = operator(&cfg).unwrap_err();
+        let op = operator(&cfg).expect("operator");
+        assert_eq!(op.info().scheme(), "dropbox");
+    }
+
+    #[test]
+    fn dropbox_operator_builds_with_refresh_flow_in_config() {
+        let cfg = StorageConfig::Dropbox(crate::config::DropboxConfig {
+            root: "/dvb".to_owned(),
+            prefix: String::new(),
+            token: None,
+            client_id: Some(SecretString::new("id")),
+            client_secret: Some(SecretString::new("secret")),
+            refresh_token: Some(SecretString::new("refresh")),
+        });
+        let op = operator(&cfg).expect("operator");
+        assert_eq!(op.info().scheme(), "dropbox");
+    }
+
+    #[test]
+    fn dropbox_rejects_missing_credentials() {
+        let cfg = crate::config::DropboxConfig {
+            root: "/dvb".to_owned(),
+            prefix: String::new(),
+            token: None,
+            client_id: None,
+            client_secret: None,
+            refresh_token: None,
+        };
+        let err = dropbox_operator_with(&cfg, |_| None).unwrap_err();
         assert!(
-            err.to_string().contains("dropbox backend is not wired up"),
+            err.to_string()
+                .contains("dropbox storage requires credentials"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn dropbox_rejects_incomplete_oauth_credentials() {
+        let cfg = crate::config::DropboxConfig {
+            root: "/dvb".to_owned(),
+            prefix: String::new(),
+            token: None,
+            client_id: Some(SecretString::new("id")),
+            client_secret: None,
+            refresh_token: None,
+        };
+        let err = dropbox_operator_with(&cfg, |_| None).unwrap_err();
+        assert!(
+            err.to_string().contains("missing required credentials"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dropbox_operator_builds_with_env_token() {
+        let cfg = crate::config::DropboxConfig {
+            root: "/dvb".to_owned(),
+            prefix: String::new(),
+            token: None,
+            client_id: None,
+            client_secret: None,
+            refresh_token: None,
+        };
+        let op = dropbox_operator_with(&cfg, |k| {
+            if k == "DROPBOX_TOKEN" {
+                Some("env-token".to_owned())
+            } else {
+                None
+            }
+        })
+        .expect("operator");
+        assert_eq!(op.info().scheme(), "dropbox");
+    }
+
+    #[test]
+    fn dropbox_operator_builds_with_env_refresh_flow() {
+        let cfg = crate::config::DropboxConfig {
+            root: "/dvb".to_owned(),
+            prefix: String::new(),
+            token: None,
+            client_id: None,
+            client_secret: None,
+            refresh_token: None,
+        };
+        let op = dropbox_operator_with(&cfg, |k| match k {
+            "DROPBOX_CLIENT_ID" => Some("env-client-id".to_owned()),
+            "DROPBOX_CLIENT_SECRET" => Some("env-client-secret".to_owned()),
+            "DROPBOX_REFRESH_TOKEN" => Some("env-refresh-token".to_owned()),
+            _ => None,
+        })
+        .expect("operator");
+        assert_eq!(op.info().scheme(), "dropbox");
     }
 
     #[test]
