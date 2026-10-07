@@ -12,14 +12,11 @@ retention_days = 14
 min_keep = 3
 
 [job.storage]
-type = "s3"
-bucket = "dvb"
-region = "us-east-1"
-endpoint = "http://s3:8333"
-prefix = "db"
-access_key_id = "dvbtest"
-secret_access_key = "dvbtest-secret"
-force_path_style = true
+type = "dropbox"
+root = "/backups"
+client_id = "dropbox_client_id"
+client_secret = "dropbox_client_secret"
+refresh_token = "dropbox_refresh_token"
 
 # Pre-backup hook: dvb runs pg_dump via `docker exec` inside the 'db' container.
 # Output goes directly to /backup/pgdump/dump.sql on the shared staging volume.
@@ -42,5 +39,5 @@ timeout_secs = 3600
 [job.restore]
 # Default extraction target directory
 dir = "/restore"
-# script = "/scripts/pg_restore.sh"         # Uncomment if psql or docker CLI is available in the dvb image
+script = "/scripts/pg_restore.sh"
 script_timeout_secs = 3600

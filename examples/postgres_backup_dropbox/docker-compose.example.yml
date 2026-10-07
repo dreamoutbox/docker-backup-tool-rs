@@ -1,0 +1,111 @@
+# Example docker-compose for dvb (Docker Volume Backup)
+#
+# Starting the daemon:
+#   docker compose -f docker-compose.example.yml up -d
+#
+# Running a one-shot backup while the daemon is running:
+#   docker exec backup dvb backup db
+#
+# Listing remote backups:
+#   docker exec backup dvb list db
+#
+# Inspecting backups via Web Dashboard:
+#   SeaweedFS Filer (file browser): http://localhost:8888/buckets/dvb/
+#   SeaweedFS Master (cluster info): http://localhost:9333/
+#
+# Dry-run retention prune:
+#   docker exec backup dvb prune db --dry-run
+#
+# Checking configuration and connectivity:
+#   docker exec backup dvb check
+#
+# Restoring a backup (default restore script from dvb.toml):
+#   docker exec backup dvb restore db
+#
+# Restoring a backup with an explicit restore hook script:
+#   docker exec backup dvb restore db --script /scripts/pg_restore.sh
+#
+# How the pg_dump backup flow works:
+#   1. dvb runs /scripts/pg_backup.sh (pre_backup_script) before each backup.
+#   2. pg_backup.sh calls pg_dump inside the 'db' container via docker exec
+#      and writes dump.sql to /backup/pgdump (a shared staging volume).
+#   3. dvb archives /backup/pgdump, compresses it, and uploads it to S3.
+#   4. On restore, dvb extracts the archive and runs /scripts/pg_restore.sh.
+
+volumes:
+  pgdump:
+  pgdata:
+
+services:
+  # Database service to back up
+  db:
+    image: postgres:18-alpine
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql
+      # Staging volume shared with the dvb container so the pre-backup hook
+      # can write dump.sql here via docker exec without needing docker CLI in dvb.
+      - pgdump:/backup/pgdump
+
+  # S3-compatible object storage gateway (SeaweedFS)
+  s3:
+    image: chrislusf/seaweedfs:latest
+    container_name: s3
+    restart: unless-stopped
+    command: [ "server", "-s3", "-s3.port=8333" ]
+    environment:
+      AWS_ACCESS_KEY_ID: dvbtest
+      AWS_SECRET_ACCESS_KEY: dvbtest-secret
+      S3_BUCKET: dvb
+    ports:
+      - "8333:8333" # S3 API
+      - "8888:8888" # SeaweedFS Filer Web UI (browse buckets and files)
+      - "9333:9333" # SeaweedFS Master Web UI (cluster status)
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://localhost:8333/status" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # dvb backup daemon service
+  backup:
+    image: dreamoutbox/dvb:latest
+    container_name: backup
+    restart: unless-stopped
+    depends_on:
+      s3:
+        condition: service_healthy
+      db:
+        condition: service_started
+    volumes:
+      # Staging directory where pg_backup.sh writes dump.sql before dvb archives it.
+      # Must be writable (no :ro) so the pre-backup script can create the dump file.
+      - pgdump:/backup/pgdump
+      # Configuration file
+      - ./dvb.example.toml:/etc/dvb/config.toml:ro
+      # Docker socket for container control (stop/start/exec).
+      # NOTE: The Docker socket gives root-equivalent host access. Mounting it :ro
+      # does NOT restrict API actions. In production, we strongly recommend using
+      # docker-socket-proxy limited to containers list/stop/start/exec:
+      #   CONTAINERS=1
+      #   POST=1
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Scripts directory: pg_backup.sh (pre-backup) and pg_restore.sh (restore hook)
+      - ./scripts:/scripts:ro
+    environment:
+      - TZ=UTC
+      - DVB_LOG=dvb=info
+      # Passed through to pg_backup.sh
+      - PGPASSWORD=postgrespassword
+      # Dropbox
+      # - DROPBOX_TOKEN=
+      # - DROPBOX_CLIENT_ID=
+      # - DROPBOX_CLIENT_SECRET=
+      # - DROPBOX_REFRESH_TOKEN=
+      # - DROPBOX_ROOT=
