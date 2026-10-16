@@ -676,9 +676,10 @@ dependencies = [
 
 [[package]]
 name = "crontext"
-version = "0.1.0"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c86f5843876f662bc73f5e57f5c91a29684852fe90d670a6a771b3d28408d14"
 dependencies = [
- "croner",
  "thiserror",
 ]
 

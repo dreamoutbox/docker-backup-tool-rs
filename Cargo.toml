@@ -1,12 +1,9 @@
-[workspace]
-members = [".", "crates/crontext"]
-
 [package]
 name = "dvb"
 version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
-description = "Docker volume backup tool: tar+compress mounted paths and stream them to object storage"
+description = "Docker volume backup tool"
 license = "MIT"
 readme = "README.md"
 
@@ -14,9 +11,6 @@ readme = "README.md"
 # Every direct dependency is pinned with `=` so a rebuild cannot silently pick
 # up a new minor version. `cargo update -p <crate> --precise <version>` is how
 # bumps happen.
-
-# Workspace members
-crontext = { path = "crates/crontext" }
 
 # CLI and process plumbing
 clap = { version = "=4.6.7", features = ["derive", "env"] }
@@ -35,6 +29,7 @@ figment = { version = "=0.10.19", features = ["toml", "env"] }
 chrono = { version = "=0.4.45", features = ["clock", "serde"] }
 chrono-tz = "=0.10.4"
 croner = "=4.0.0"
+crontext = "=1.0.0"
 
 # Storage. `default-features = false` plus explicit features keeps the TLS
 # stack on rustls; native-tls/openssl must never appear in `cargo tree`.

@@ -87,7 +87,8 @@ pub struct DockerConfig {
     pub socket: Option<PathBuf>,
 }
 
-pub use crontext::{self, CrontextError, Schedule};
+pub use crontext::errors::CrontextError;
+pub use crontext::schedule::Schedule;
 
 /// Origin of a job's schedule (raw cron vs natural-language crontext).
 #[derive(Debug, Clone, PartialEq, Eq)]
